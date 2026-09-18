@@ -240,7 +240,14 @@ impl IpcHandler for DaemonState {
 /// Run the daemon until shutdown.
 pub async fn run() -> Result<()> {
     let log_dir = crate::identity::ensure_data_dir()?;
-    let _log_guard = init_tracing(&log_dir)?;
+    // Peek at the config's log level before tracing is initialised: `RUST_LOG`
+    // still wins below, but the `[log] level` knob needs to reach EnvFilter. A
+    // missing/broken config falls back to the `info` default (validated again
+    // below where config load can fail loudly).
+    let config_log_level = config::load(&config::config_path(None)?)
+        .ok()
+        .and_then(|c| c.log.level.clone());
+    let _log_guard = init_tracing(&log_dir, config_log_level.as_deref())?;
 
     // Single-instance guard: refuse to start a second daemon against the same
     // state directory (the OS releases this lock if we exit or crash).
@@ -395,6 +402,7 @@ pub async fn run() -> Result<()> {
 /// `0700`), so their contents stay user-only.
 fn init_tracing(
     log_dir: &std::path::Path,
+    config_level: Option<&str>,
 ) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::prelude::*;
 
@@ -407,9 +415,14 @@ fn init_tracing(
         .context("failed to create the log file appender")?;
     let (file_writer, guard) = tracing_appender::non_blocking(appender);
 
-    // Default to `info` so the log file is useful out of the box; `RUST_LOG`
-    // still overrides it.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // `RUST_LOG` wins; otherwise the `[log] level` config knob applies; when
+    // neither is set the default is `info` so the log file is useful out of the
+    // box.
+    let filter = EnvFilter::try_from_default_env().or_else(|_| {
+        config_level
+            .and_then(|level| EnvFilter::try_new(level).ok())
+            .ok_or(())
+    }).unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(filter)
