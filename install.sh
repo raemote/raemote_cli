@@ -241,7 +241,14 @@ actual=$(sha256_of "$tmp/$ASSET")
 [ "$expected" = "$actual" ] || die "checksum mismatch for $ASSET (expected $expected, got $actual)"
 
 tar -xzf "$tmp/$ASSET" -C "$tmp" || die "failed to extract $ASSET"
-[ -f "$tmp/raemote" ] && [ -f "$tmp/raemoted" ] || die "archive did not contain raemote/raemoted"
+# Only regular files at the two expected names may be installed: a symlink
+# member would be dereferenced by the copy below (even pointing outside the
+# staging dir) and a script member would be executed by the --version probe.
+for bin in raemote raemoted; do
+    if [ -L "$tmp/$bin" ] || [ ! -f "$tmp/$bin" ]; then
+        die "archive member '$bin' is not a regular file; refusing to install"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Install
