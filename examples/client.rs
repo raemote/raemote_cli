@@ -87,7 +87,17 @@ async fn main() -> Result<()> {
         "ws" => {
             let node = args.next().context(usage())?;
             let path = args.next().unwrap_or_else(|| "/app/app/socket".to_string());
-            ws(&endpoint, parse_node(&node)?, &path).await
+            // `--idle <secs>` holds the socket open afterwards and reports
+            // whether it survived, which is what a long-lived WebSocket
+            // (Jellyfin's `/socket`) needs from the tunnel.
+            let rest: Vec<String> = args.by_ref().collect();
+            let idle = rest
+                .iter()
+                .position(|arg| arg == "--idle")
+                .and_then(|i| rest.get(i + 1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            ws(&endpoint, parse_node(&node)?, &path, idle).await
         }
         _ => Err(anyhow::anyhow!(usage())),
     }
@@ -112,7 +122,7 @@ async fn bind(endpoint: &Endpoint, node: EndpointId, token: &str) -> Result<()> 
     Ok(())
 }
 
-async fn ws(endpoint: &Endpoint, node: EndpointId, path: &str) -> Result<()> {
+async fn ws(endpoint: &Endpoint, node: EndpointId, path: &str, idle: u64) -> Result<()> {
     let connection = endpoint
         .connect(node, SERVE_ALPN)
         .await
@@ -150,6 +160,34 @@ async fn ws(endpoint: &Endpoint, node: EndpointId, path: &str) -> Result<()> {
         frame.push(byte ^ mask[i % 4]);
     }
     send.write_all(&frame).await?;
+
+    // With --idle, skip the echo expectation: just watch the socket and report
+    // whether it is still open when the timer runs out.
+    if idle > 0 {
+        let start = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(idle);
+        loop {
+            match tokio::time::timeout_at(deadline, recv.read(&mut tmp)).await {
+                Err(_) => {
+                    println!("--- idle ---\nstill open after {idle}s");
+                    break;
+                }
+                Ok(Ok(Some(0))) | Ok(Ok(None)) => {
+                    println!("--- idle ---\nCLOSED after {:.1}s", start.elapsed().as_secs_f64());
+                    break;
+                }
+                Ok(Ok(Some(n))) => {
+                    println!("--- idle ---\nreceived {n} bytes at {:.1}s", start.elapsed().as_secs_f64());
+                }
+                Ok(Err(err)) => {
+                    println!("--- idle ---\nERROR after {:.1}s: {err}", start.elapsed().as_secs_f64());
+                    break;
+                }
+            }
+        }
+        send.finish()?;
+        return Ok(());
+    }
 
     // Read the (unmasked) echo frame.
     while buf.len() < 2 {
@@ -275,5 +313,5 @@ fn client_key_path() -> Result<PathBuf> {
 }
 
 fn usage() -> String {
-    "usage: client bind <node-id> <token> | client bind <raemote://bind?...> | client get <node-id> [path] | client request <node-id> <METHOD> <path> [json-body|-] [Header: value]... | client ws <node-id> <path>   [--key <path>]".to_string()
+    "usage: client bind <node-id> <token> | client bind <raemote://bind?...> | client get <node-id> [path] | client request <node-id> <METHOD> <path> [json-body|-] [Header: value]... | client ws <node-id> <path> [--idle <secs>]   [--key <path>]".to_string()
 }
