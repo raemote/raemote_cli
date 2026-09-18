@@ -308,8 +308,27 @@ async fn handle(
 ) -> Result<Response<ResBody>, io::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let headers: Vec<_> = req.headers().iter().map(|(k, v)| format!("{k}: {v:?}")).collect();
-    tracing::info!(%method, %path, ?headers, "HTTP request received");
+    // Credential-bearing headers (cookies, authorization) and query strings are
+    // omitted from metadata logs; full headers only at debug level. This keeps
+    // default (`info`) logs free of live session credentials.
+    tracing::info!(%method, %path, "HTTP request received");
+    tracing::debug!(
+        ?method,
+        ?path,
+        headers = tracing::field::debug(
+            req.headers()
+                .iter()
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_str().to_ascii_lowercase().as_str(),
+                        "cookie" | "authorization"
+                    )
+                })
+                .map(|(k, v)| format!("{k}: {v:?}"))
+                .collect::<Vec<_>>()
+        ),
+        "credential-filtered headers"
+    );
 
     if path == "/_hub/catalog" {
         let resp = catalog(&state);
@@ -581,8 +600,12 @@ async fn proxy_upgrade(
     head.push_str("\r\n");
 
     tracing::info!(
-        upstream = %format!("{}://{}{}", origin.scheme.as_str(), origin.authority(), target),
+        upstream = %format!("{}://{}/{}", origin.scheme.as_str(), origin.authority(), sub_path),
         "proxying upgrade"
+    );
+    tracing::debug!(
+        upstream = %format!("{}://{}{}", origin.scheme.as_str(), origin.authority(), redact_query(&target)),
+        "proxying upgrade target"
     );
 
     let mut upstream = tokio::net::TcpStream::connect((origin.host.as_str(), origin.port))
@@ -661,6 +684,7 @@ async fn proxy_upgrade(
     let leftover = buf[head_end..].to_vec();
 
     tokio::spawn(async move {
+        let started = std::time::Instant::now();
         let upgraded = match client_upgrade.await {
             Ok(upgraded) => upgraded,
             Err(err) => {
@@ -676,10 +700,25 @@ async fn proxy_upgrade(
             return;
         }
         match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+            // Info, not debug: a tunneled WebSocket closing is rare enough to
+            // be worth seeing by default, and the lifetime is exactly what
+            // tells a client-side reconnect loop apart from a server-side drop.
             Ok((to_client, to_upstream)) => {
-                tracing::debug!(to_client, to_upstream, "upgrade tunnel closed")
+                tracing::info!(
+                    lived_ms = started.elapsed().as_millis() as u64,
+                    to_client,
+                    to_upstream,
+                    "upgrade tunnel closed"
+                )
             }
-            Err(err) => tracing::debug!(?err, "upgrade tunnel error"),
+            // A client that vanishes without a clean close (app backgrounded,
+            // network changed, connection lost) lands here rather than in the
+            // `Ok` branch, so this is logged at info with the lifetime too.
+            Err(err) => tracing::info!(
+                lived_ms = started.elapsed().as_millis() as u64,
+                ?err,
+                "upgrade tunnel error"
+            ),
         }
     });
 
@@ -710,7 +749,17 @@ async fn proxy(
         sub_path,
         query
     );
-    tracing::info!(upstream = %upstream_uri, "proxying request to origin");
+    // Log the path without any query string: token-bearing queries must not
+    // reach default (info) logs. The debug line keeps parameter names but
+    // redacts their values, because both layers are persisted to the log file.
+    tracing::info!(
+        upstream = %format!("{}://{}/{}", origin.scheme.as_str(), origin.authority(), sub_path),
+        "proxying request to origin"
+    );
+    tracing::debug!(
+        upstream = %redact_query(&upstream_uri),
+        "proxying request with query"
+    );
 
     let (parts, body) = req.into_parts();
     let mut builder = Request::builder().method(parts.method).uri(upstream_uri);
@@ -792,6 +841,28 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+/// A path+query with query *values* removed, so tokens and API keys never
+/// reach the log. Parameter names are kept, which is what makes a log useful
+/// when debugging auth.
+fn redact_query(path_and_query: &str) -> String {
+    let Some((path, query)) = path_and_query.split_once('?') else {
+        return path_and_query.to_string();
+    };
+    let redacted: Vec<String> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let name = pair.split('=').next().unwrap_or(pair);
+            format!("{name}=…")
+        })
+        .collect();
+    if redacted.is_empty() {
+        format!("{path}?")
+    } else {
+        format!("{path}?{}", redacted.join("&"))
+    }
 }
 
 /// The upstream base URL for an origin (`http://host:port`).
@@ -898,6 +969,25 @@ fn full(body: impl Into<Bytes>) -> ResBody {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redact_query_keeps_names_drops_values() {
+        use super::redact_query;
+        // Tokens and API keys ride in the query; the names still make a log
+        // useful, the values must not be there.
+        assert_eq!(redact_query("/socket?ApiKey=abc123"), "/socket?ApiKey=…");
+        assert_eq!(
+            redact_query("/x?a=1&b=2"),
+            "/x?a=…&b=…"
+        );
+        // Also works on a whole URI, which is what the proxy logs.
+        assert_eq!(
+            redact_query("http://127.0.0.1:8096/socket?ApiKey=abc&x=1"),
+            "http://127.0.0.1:8096/socket?ApiKey=…&x=…"
+        );
+        assert_eq!(redact_query("/plain"), "/plain");
+        assert_eq!(redact_query("/?"), "/?");
+    }
+
     use super::*;
     use std::time::Duration;
 
