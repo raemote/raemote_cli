@@ -220,7 +220,15 @@ impl DiscoveryEngine {
         let manual = self.config.read().expect("config poisoned").apps.clone();
         let discovered: Vec<DiscoveredApp> =
             self.cache.values().map(|c| c.app.clone()).collect();
-        let catalog = Catalog::rebuild(&manual, &discovered);
+        // Carry the previous name→origin pins so a published name is never
+        // silently handed to a different origin (name-squatting guard).
+        let previous = self
+            .catalog
+            .read()
+            .expect("catalog poisoned")
+            .pinned()
+            .clone();
+        let catalog = Catalog::rebuild_with_pins(&manual, &discovered, &previous);
         *self.catalog.write().expect("catalog poisoned") = catalog;
         self.catalog_generation.fetch_add(1, Ordering::Relaxed);
     }

@@ -23,7 +23,9 @@ const MAX_BIND_REQUEST: usize = 512;
 const FINISH_GRACE: Duration = Duration::from_secs(5);
 /// Maximum time to wait for the client to send its token line.
 const BIND_TIMEOUT: Duration = Duration::from_secs(10);
-/// Default max concurrent bind connections (override: `RAEMOTE_MAX_BIND_CONNECTIONS`).
+/// Default max concurrent bind connections, used by the daemon when the
+/// configured `bind.max_concurrent_connections` value applies (the daemon
+/// wires `RAEMOTE_MAX_BIND_CONNECTIONS`/config.toml at start; see daemon.rs).
 pub const DEFAULT_MAX_BIND_CONNECTIONS: usize = 50;
 
 /// Handler for [`BIND_ALPN`].

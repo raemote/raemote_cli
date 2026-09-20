@@ -16,6 +16,7 @@ exclude = [
     "/.github",
     "/dist",
     "/docs",
+    "/examples",
     "/scripts",
     "/skills",
     "/install.sh",

@@ -34,6 +34,10 @@ pub fn is_installed() -> bool {
 fn plist_content() -> Result<String> {
     let raemoted = raemoted_path()?;
     let config_path = crate::config::config_path(None)?;
+    // Records are already persisted (rotated, count-capped) by the daemon's
+    // own `~/.raemote` appender (daemon.rs `init_tracing`), so stderr goes to
+    // /dev/null: nothing from the daemon lands in world-writable, unmanaged
+    // sinks like /tmp.
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -56,8 +60,6 @@ fn plist_content() -> Result<String> {
     </dict>
     <key>StandardOutPath</key>
     <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/raemoted.err.log</string>
 </dict>
 </plist>
 "#,

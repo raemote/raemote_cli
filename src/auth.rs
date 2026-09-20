@@ -156,15 +156,35 @@ struct Inner {
     /// Outstanding one-time invitations, keyed by their token (hex).
     invitations: HashMap<String, Invitation>,
     failed_attempts: u32,
+    /// Revoked nodes mapped to the generation of the token that was live at
+    /// revocation time; presenting a token minted at or before that generation
+    /// is denied for that node. In-memory only: a restart has no live token
+    /// to resurrect (startup mints fresh), which matches the design where a
+    /// restart invalidates in-memory pairing state.
+    revoked: HashMap<EndpointId, u64>,
+    /// Next token generation counter, bumped on every mint.
+    next_generation: u64,
 }
 
+/// Credentials revoked along with a device: the generation of the pairing
+/// token that was live when the device was revoked. The revoked node may not
+/// present that token (or any earlier generation) again; a token minted
+/// *after* the revocation is a fresh capability and works normally.
+///
+/// Check `generation` and `revoked` under the same lock, so an expired token
+/// presentation and a concurrent revocation cannot double-spend.
 #[derive(Debug)]
+#[derive(Clone)]
 struct PendingToken {
     token_hex: String,
     expires_at: Instant,
     /// Wall-clock expiry captured at mint time, so the value embedded in the
     /// pairing URI does not drift as time passes.
     expires_at_unix: u64,
+    /// Monotonic generation, bumped on every mint. `revoke()` marks a revoked
+    /// node with the generation that was live at revocation time; presenting a
+    /// token whose generation is at or below that mark is denied.
+    generation: u64,
 }
 
 /// A one-time invitation: whoever redeems it first becomes an authorized
@@ -211,6 +231,8 @@ impl AuthState {
                 names,
                 invitations: HashMap::new(),
                 failed_attempts: 0,
+                revoked: HashMap::new(),
+                next_generation: 0,
             }),
             store_path,
             names_path,
@@ -274,6 +296,15 @@ impl AuthState {
                 return false;
             }
             inner.names.remove(&node);
+            // Revocation must not be reversible by the revoked party: mark the
+            // node with the current token generation, so the still-live
+            // multi-use token no longer re-binds it. A token minted *after*
+            // the revocation is a fresh capability (other devices may still be
+            // pairing); the marker does not block that. In-memory only — a
+            // restart has no live token to resurrect.
+            if let Some(generation) = inner.pending.as_ref().map(|p| p.generation) {
+                inner.revoked.insert(node, generation);
+            }
             (
                 inner.authenticated.iter().map(|id| id.to_string()).collect(),
                 inner
@@ -376,10 +407,12 @@ impl AuthState {
             ttl,
         };
         let mut inner = self.inner.lock().expect("auth state poisoned");
+        inner.next_generation += 1;
         inner.pending = Some(PendingToken {
             token_hex: info.token_hex.clone(),
             expires_at: Instant::now() + ttl,
             expires_at_unix: info.expires_at_unix,
+            generation: inner.next_generation,
         });
         inner.failed_attempts = 0;
         info
@@ -440,15 +473,21 @@ impl AuthState {
             .retain(|_, invitation| now < invitation.expires_at);
 
         // 1. The multi-use pairing token (valid until it expires).
-        let active = inner
-            .pending
-            .as_ref()
-            .filter(|pending| now < pending.expires_at)
-            .map(|pending| pending.token_hex.clone());
+        let active = inner.pending.clone().filter(|pending| now < pending.expires_at);
 
-        if let Some(token_hex) = active.as_deref()
-            && constant_time_eq(presented.as_bytes(), token_hex.as_bytes())
+        if let Some(pending) = active.as_ref()
+            && constant_time_eq(presented.as_bytes(), pending.token_hex.as_bytes())
         {
+            // A node revoked while this token generation was live cannot use
+            // the token to re-authorize itself; only a token minted after the
+            // revocation (a fresh capability) may do so.
+            if inner
+                .revoked
+                .get(&node)
+                .is_some_and(|marker| *marker >= pending.generation)
+            {
+                return BindOutcome::NoActiveToken;
+            }
             let entries = Self::authorize(&mut inner, node);
             drop(inner);
             if let Err(err) = save_authorized(&self.store_path, &entries) {
@@ -503,6 +542,9 @@ impl AuthState {
     /// the failure counter, and return the entries to persist.
     fn authorize(inner: &mut Inner, node: EndpointId) -> Vec<String> {
         inner.authenticated.insert(node);
+        // The node is authorized again; the revocation marker is moot (and
+        // would otherwise grow without bound).
+        inner.revoked.remove(&node);
         inner.failed_attempts = 0;
         inner.authenticated.iter().map(|id| id.to_string()).collect()
     }
@@ -622,6 +664,8 @@ mod tests {
                 names: HashMap::new(),
                 invitations: HashMap::new(),
                 failed_attempts: 0,
+                revoked: HashMap::new(),
+                next_generation: 0,
             }),
             store_path: std::env::temp_dir().join(format!("raemote-test-{name}")),
             names_path: std::env::temp_dir().join(format!("raemote-test-{name}.names")),
@@ -726,16 +770,41 @@ mod tests {
     }
 
     #[test]
-    fn revoked_device_can_rebind_with_a_fresh_token() {
+    fn revoked_device_cannot_reuse_the_old_token_until_a_fresh_mint() {
         let state = test_state("revoke-rebind");
         let info = state.mint_token(Duration::from_secs(60));
         assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
         assert!(state.revoke(node(1)));
 
-        // The (multi-use, unexpired) token still works, so pairing again
-        // re-authorizes the same device.
-        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+        // Revocation is not reversible by the revoked party: the token that
+        // was live at revocation time no longer re-binds the device (this used
+        // to succeed — see the security audit finding about the rebind
+        // window).
+        assert_eq!(
+            state.authenticate(node(1), &info.token_hex),
+            BindOutcome::NoActiveToken
+        );
+        assert!(!state.is_authorized(node(1)));
+
+        // A freshly minted token is a new capability; the revoked node may be
+        // re-paired deliberately by the owner.
+        let fresh = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &fresh.token_hex), BindOutcome::Bound);
         assert!(state.is_authorized(node(1)));
+    }
+
+    #[test]
+    fn other_paired_devices_survive_one_device_revocation_during_paring() {
+        let state = test_state("revoke-rebind-multi");
+        let info = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+        assert_eq!(state.authenticate(node(2), &info.token_hex), BindOutcome::Bound);
+        assert!(state.revoke(node(1)));
+        // The same token generation stays live and solely node(1)'s re-bind is
+        // denied; other nodes may still pair.
+        assert_eq!(state.authenticate(node(3), &info.token_hex), BindOutcome::Bound);
+        assert!(state.is_authorized(node(3)));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::NoActiveToken);
     }
 
     #[test]

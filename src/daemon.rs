@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
 
 use crate::auth::AuthState;
-use crate::bind::{BindHandler, BIND_ALPN, DEFAULT_MAX_BIND_CONNECTIONS};
+use crate::bind::{BindHandler, BIND_ALPN};
 use crate::catalog::Catalog;
 use crate::config::{self, Config};
 use crate::discovery::{self, DiscoveryEngine};
@@ -146,6 +146,11 @@ impl IpcHandler for DaemonState {
                         if cfg.network.proxy != new_cfg.network.proxy {
                             restart_required.push("network.proxy".into());
                         }
+                        if cfg.bind.max_concurrent_connections
+                            != new_cfg.bind.max_concurrent_connections
+                        {
+                            restart_required.push("bind.max_concurrent_connections".into());
+                        }
                     }
                     // Apply hot-reloadable fields.
                     {
@@ -185,6 +190,14 @@ impl IpcHandler for DaemonState {
             Request::RevokeAuthorized { node_id } => match node_id.parse::<iroh::EndpointId>() {
                 Ok(id) => {
                     if self.auth.revoke(id) {
+                        // A pinned pairing token cannot have its value
+                        // rotated by the daemon: the owner must unset it or
+                        // re-mint deliberately.
+                        if self.config.read().expect("config poisoned").bind.token.is_some() {
+                            tracing::warn!(
+                                "device {node_id} revoked; note: bind.token is pinned, so the token value stays valid until the config changes"
+                            );
+                        }
                         Response::Ok
                     } else {
                         Response::Error(format!("device {node_id} is not authorized"))
@@ -271,6 +284,15 @@ pub async fn run() -> Result<()> {
 
     let secret_key = crate::identity::load_or_create_secret_key()?;
     let mut builder = Endpoint::builder(presets::N0);
+    // A configured private relay replaces N0's default relay map; the preset
+    // otherwise pins endpoint relay discovery to the default N0 set.
+    if let Some(relay) = &cfg.network.relay_url {
+        let url: iroh::RelayUrl = relay
+            .parse()
+            .with_context(|| format!("invalid network.relay_url: {relay}"))?;
+        tracing::info!("using configured relay {url}");
+        builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
+    }
     if let Some(proxy) = crate::proxy::resolve(cfg.network.proxy.as_deref())? {
         tracing::info!(
             "using outbound proxy {} for iroh relay/discovery",
@@ -283,6 +305,11 @@ pub async fn run() -> Result<()> {
     tracing::info!("node id: {}", endpoint.id());
     tracing::info!("addr: {:?}", endpoint.addr());
     tracing::info!("sockets: {:?}", endpoint.bound_sockets());
+
+    // Pin down the bind-level values before `cfg` is moved into the shared
+    // config (the bind handler cannot change mid-run; reload reports the
+    // fields as restart-required).
+    let bind_concurrency = cfg.bind.max_concurrent_connections;
 
     let auth = Arc::new(AuthState::load(cfg.bind.max_failed_attempts)?);
     let ttl = Duration::from_secs(cfg.bind.token_ttl_secs);
@@ -310,10 +337,13 @@ pub async fn run() -> Result<()> {
         }),
     ));
 
+    // The knob is applied at handler construction (it cannot change during a
+    // run; reload reports it as restart-required instead of silently relying
+    // on the default).
     let _router = Router::builder(endpoint.clone())
         .accept(
             BIND_ALPN,
-            BindHandler::new(auth.clone(), DEFAULT_MAX_BIND_CONNECTIONS),
+            BindHandler::new(auth.clone(), bind_concurrency),
         )
         .accept(
             SERVE_ALPN,

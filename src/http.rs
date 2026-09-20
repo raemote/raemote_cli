@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -306,6 +306,17 @@ async fn handle(
     auth: Arc<AuthState>,
     node: EndpointId,
 ) -> Result<Response<ResBody>, io::Error> {
+    // Revocation is enforced per request, matching the comment on the accept
+    // loop: a device revoked mid-connection must lose access on its next
+    // request even when it is multiplexed on an already-accepted stream.
+    if !auth.is_authorized(node) {
+        tracing::warn!(node = %node.fmt_short(), "denying request from revoked device");
+        return Ok(error_response_with_close(
+            StatusCode::UNAUTHORIZED,
+            "revoked",
+            "this device is no longer authorized",
+        ));
+    }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // Credential-bearing headers (cookies, authorization) and query strings are
@@ -476,6 +487,45 @@ fn devices(auth: &AuthState, node: EndpointId) -> Response<ResBody> {
     json_response(StatusCode::OK, serde_json::json!({ "devices": devices }))
 }
 
+/// Largest body accepted on the small JSON routes (rename); larger requests
+/// are refused with 413 instead of being buffered in daemon memory.
+const MAX_RENAME_BODY: usize = 8 * 1024;
+
+enum LimitError {
+    TooLarge,
+    Io,
+}
+
+/// Collect a bounded amount of body, refusing past `MAX_RENAME_BODY` so an
+/// oversized body cannot buffer unbounded daemon memory.
+async fn collect_limited_body(req: Request<Incoming>) -> Result<Bytes, LimitError> {
+    use hyper::body::Body as HyperBody;
+    let mut collected = BytesMut::new();
+    // A declared Content-Length past the cap is refused before reading.
+    if let Some(len) = req.body().size_hint().exact()
+        && len > MAX_RENAME_BODY as u64
+    {
+        return Err(LimitError::TooLarge);
+    }
+    let mut body = req.into_body();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                let data = match frame.into_data() {
+                    Ok(data) => data,
+                    Err(_) => return Err(LimitError::Io),
+                };
+                collected.extend_from_slice(&data);
+                if collected.len() > MAX_RENAME_BODY {
+                    return Err(LimitError::TooLarge);
+                }
+            }
+            Some(Err(_)) => return Err(LimitError::Io),
+            None => return Ok(collected.freeze()),
+        }
+    }
+}
+
 /// `PUT /_hub/device`: let a device set its own display name.
 async fn rename_self(
     auth: &AuthState,
@@ -487,9 +537,19 @@ async fn rename_self(
         name: String,
     }
 
-    let body = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+    // Bound the body: the payload is one short display name, so anything
+    // larger is refused before buffering (a paired device could otherwise
+    // hold an unbounded buffer — and a concurrency permit — in daemon memory).
+    // The declared Content-Length is checked inside `collect_limited_body`.
+    let body = match collect_limited_body(req).await {
+        Ok(body) => body,
+        Err(LimitError::TooLarge) => return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "request body too large",
+            None,
+        ),
+        Err(LimitError::Io) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "bad_request",
@@ -608,37 +668,62 @@ async fn proxy_upgrade(
         "proxying upgrade target"
     );
 
-    let mut upstream = tokio::net::TcpStream::connect((origin.host.as_str(), origin.port))
-        .await
-        .map_err(io::Error::other)?;
-    upstream
-        .write_all(head.as_bytes())
-        .await
-        .map_err(io::Error::other)?;
+    // Bound the handshake: connect + head read use the same deadline as the
+    // buffered proxy path, so an origin that accepts and stalls cannot wedge a
+    // per-node stream slot indefinitely.
+    let handshake = tokio::time::timeout(
+        PROXY_TIMEOUT,
+        async {
+            let mut upstream =
+                tokio::net::TcpStream::connect((origin.host.as_str(), origin.port)).await?;
+            upstream.write_all(head.as_bytes()).await?;
 
-    // Read the origin's response head (through CRLFCRLF).
-    let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 1024];
-    let head_end = loop {
-        let n = upstream.read(&mut tmp).await.map_err(io::Error::other)?;
-        if n == 0 {
+            // Read the origin's response head (through CRLFCRLF).
+            let mut buf = Vec::with_capacity(1024);
+            let mut tmp = [0u8; 1024];
+            while buf.windows(4).all(|window| window != b"\r\n\r\n") {
+                let n = upstream.read(&mut tmp).await?;
+                if n == 0 {
+                    return Err(io::Error::other("the app closed the connection"));
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.len() > 64 * 1024 {
+                    return Err(io::Error::other("the app sent an oversized upgrade response"));
+                }
+            }
+            let pos = buf.windows(4).position(|window| window == b"\r\n\r\n");
+            Ok::<_, io::Error>((upstream, buf, pos.expect("checked above") + 4))
+        },
+    )
+    .await;
+
+    let (mut upstream, buf, head_end) = match handshake {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => {
+            // The origin closed early or sent an oversized head: the same
+            // 502 the buffered path would give.
+            tracing::debug!(authority = %origin.authority(), ?err, "upgrade handshake failed");
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
-                "the app closed the connection before completing the upgrade",
+                "the app failed the WebSocket upgrade handshake",
                 None,
             ));
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if buf.len() > 64 * 1024 {
+        // Deadline exceeded: the permit and origin socket are released here.
+        Err(_elapsed) => {
+            tracing::warn!(
+                authority = %origin.authority(),
+                "upgrade handshake exceeded the {PROXY_TIMEOUT:?} deadline"
+            );
             return Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                "the app sent an oversized upgrade response",
-                None,
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                &format!(
+                    "the app at {} took too long to complete the WebSocket upgrade",
+                    origin.authority()
+                ),
+                Some("it may be busy or stuck; try again"),
             ));
         }
     };
@@ -959,6 +1044,18 @@ fn error_response(
     hint: Option<&str>,
 ) -> Response<ResBody> {
     json_response(status, error_body(code, message, hint))
+}
+
+/// An error response that also ends the HTTP/1.1 connection, used for a
+/// revocation that must end the accepted stream's serving session promptly.
+fn error_response_with_close(status: StatusCode, code: &str, message: &str) -> Response<ResBody> {
+    let body = serde_json::to_vec(&error_body(code, message, None)).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::CONNECTION, "close")
+        .body(full(body))
+        .expect("static response is valid")
 }
 
 fn full(body: impl Into<Bytes>) -> ResBody {

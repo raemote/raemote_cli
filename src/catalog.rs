@@ -4,7 +4,7 @@
 //! [`crate::discovery`], giving each a unique, URL-safe name that
 //! `/app/{name}` can route to.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,15 +52,29 @@ pub struct CatalogApp {
 ///
 /// Rebuilt wholesale (cheap; tens of entries) whenever config or discovery
 /// changes, so readers never see a partially updated catalog.
+///
+/// Discovered names are **pinned to their origin** for the lifetime of the
+/// pin map: a name that was published for origin O is not handed to a
+/// different origin on a later rebuild (a hostile local app cannot take over
+/// an existing app's `/app/{name}` route — and with it the phone's per-app
+/// web origin — by claiming the same title on a lower port).
 #[derive(Debug, Default)]
 pub struct Catalog {
     apps: Vec<CatalogApp>,
+    /// Published name → origin bindings carried across rebuilds. A name is
+    /// only reassignable when its pinned origin is no longer a candidate in
+    /// this rebuild (one-rebuild grace: a real app that briefly disappears
+    /// keeps its name; a claimant on a different origin is suffixed).
+    pinned: HashMap<String, Origin>,
 }
 
 impl Catalog {
     /// An empty catalog.
     pub fn empty() -> Self {
-        Self { apps: Vec::new() }
+        Self {
+            apps: Vec::new(),
+            pinned: HashMap::new(),
+        }
     }
 
     /// Merge manual `[[apps]]` (authoritative) with discovered apps.
@@ -69,7 +83,20 @@ impl Catalog {
     ///   app on the same origin.
     /// - Discovered names are slugified and de-duplicated against manual and
     ///   other discovered names by appending the port (then a counter).
+    /// - Names bound to an origin by a previous rebuild are pinned: an
+    ///   existing name is not reassigned to a different origin while that
+    ///   origin is still a candidate.
     pub fn rebuild(manual: &[AppConfig], discovered: &[DiscoveredApp]) -> Self {
+        Self::rebuild_with_pins(manual, discovered, &HashMap::new())
+    }
+
+    /// [`Catalog::rebuild`] with name→origin pins carried over from the
+    /// previous rebuild, for binding a published name to its origin.
+    pub fn rebuild_with_pins(
+        manual: &[AppConfig],
+        discovered: &[DiscoveredApp],
+        previous: &HashMap<String, Origin>,
+    ) -> Self {
         let mut apps = Vec::with_capacity(manual.len() + discovered.len());
         let mut used: HashSet<String> = HashSet::new();
         let mut manual_origins: HashSet<Origin> = HashSet::new();
@@ -99,12 +126,45 @@ impl Catalog {
                 .then_with(|| a.origin.host.cmp(&b.origin.host))
         });
 
+        // Pins only bind while their origin is still a candidate. A pin whose
+        // origin vanished (the app stopped) keeps its name reserved for one
+        // rebuild grace — the name is not handed to a same-title newcomer in
+        // that rebuild — and is dropped afterwards (a later claimant can take
+        // the name, which is the deliberate "app moved" recovery).
+        let candidates: HashSet<Origin> = discovered.iter().map(|d| d.origin.clone()).collect();
+        let mut pinned: HashMap<String, Origin> = previous
+            .iter()
+            .filter(|(_, origin)| candidates.contains(origin))
+            .map(|(n, o)| (n.clone(), o.clone()))
+            .collect();
+        // Pre-reserve pinned names so a lower-port impostor processed first
+        // cannot take a name its origin did not own.
+        let mut reserved_by_origin: HashMap<Origin, String> = HashMap::new();
+        for (name, origin) in &pinned {
+            used.insert(name.clone());
+            reserved_by_origin.insert(origin.clone(), name.clone());
+        }
+        let grace: Vec<(String, Origin)> = previous
+            .iter()
+            .filter(|(_, origin)| !candidates.contains(origin))
+            .map(|(n, o)| (n.clone(), o.clone()))
+            .collect();
+        // Reserve the grace names for this rebuild only: a same-title
+        // newcomer is suffixed instead of claiming them right away.
+        for (name, _) in &grace {
+            used.insert(name.clone());
+        }
+
         for d in discovered {
             // A manual entry on the same origin wins; don't expose it twice.
             if manual_origins.contains(&d.origin) {
                 continue;
             }
-            let name = unique_name(&name_base(d), d.origin.port, &mut used);
+            let name = match reserved_by_origin.remove(&d.origin) {
+                Some(name) => name,
+                None => unique_name(&name_base(d), d.origin.port, &mut used),
+            };
+            pinned.insert(name.clone(), d.origin.clone());
             apps.push(CatalogApp {
                 name,
                 title: d.title.clone(),
@@ -115,7 +175,12 @@ impl Catalog {
             });
         }
 
-        Self { apps }
+        Self { apps, pinned }
+    }
+
+    /// The name→origin pins this catalog is built on (carried across rebuilds).
+    pub fn pinned(&self) -> &HashMap<String, Origin> {
+        &self.pinned
     }
 
     /// All entries: manual first, then discovered.
@@ -306,5 +371,48 @@ mod tests {
         let catalog = Catalog::rebuild(&manual, &[discovered("Dashboard", 3000)]);
         let names: Vec<_> = catalog.apps().iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["dashboard", "dashboard-3000"]);
+    }
+
+    #[test]
+    fn published_name_is_pinned_to_its_origin_across_rebuilds() {
+        // First scan: SPIS on 8081 wins the plain name.
+        let first = Catalog::rebuild(&[], &[discovered("SPIS", 8081)]);
+        assert_eq!(first.find("spis").unwrap().origin.port, 8081);
+
+        // Second scan: a lower-port impostor with the same title appears.
+        // The pin keeps "spis" bound to 8081; the impostor is suffixed.
+        let second = Catalog::rebuild_with_pins(
+            &[],
+            &[discovered("SPIS", 3000), discovered("SPIS", 8081)],
+            first.pinned(),
+        );
+        assert_eq!(second.find("spis").unwrap().origin.port, 8081);
+        let impostor = second
+            .apps()
+            .iter()
+            .find(|a| a.origin.port == 3000)
+            .expect("impostor entry exists");
+        assert_ne!(impostor.name, "spis");
+    }
+
+    #[test]
+    fn stopped_app_frees_its_name_after_one_rebuild_grace() {
+        let first = Catalog::rebuild(&[], &[discovered("SPIS", 8081)]);
+        assert_eq!(first.find("spis").unwrap().origin.port, 8081);
+        // Real app stops; nothing on 8081 anymore: the name is *free*, not
+        // handed to a same-title claimant on another origin.
+        let second = Catalog::rebuild_with_pins(&[], &[discovered("SPIS", 3000)], first.pinned());
+        assert!(second.find("spis").is_none());
+        assert!(second.find("spis-3000").is_some());
+        // The claimant's assigned name is stable from then on (a later reclaim
+        // of the freed plain name would only churn the phone's per-app origin
+        // again), so `spis` stays free while the surviving entry keeps its
+        // suffixed name.
+        let third = Catalog::rebuild_with_pins(&[], &[discovered("SPIS", 3000)], second.pinned());
+        assert!(third.find("spis").is_none());
+        assert_eq!(
+            third.find("spis-3000").expect("name stable after grace").origin.port,
+            3000
+        );
     }
 }

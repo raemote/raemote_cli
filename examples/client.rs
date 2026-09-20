@@ -300,11 +300,35 @@ fn load_or_create_client_key(explicit: Option<&Path>) -> Result<SecretKey> {
         let key = SecretKey::generate();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
+            // The key is this device's identity; it must not be world-readable
+            // regardless of the runner's umask (mirrors the daemon path in
+            // `raemote::identity`).
+            raemote::identity::restrict(parent, 0o700);
         }
-        std::fs::write(&path, key.to_bytes())
+        write_private(&path, &key.to_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(key)
     }
+}
+
+/// Write secret key material 0600 regardless of the ambient umask.
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 fn client_key_path() -> Result<PathBuf> {
