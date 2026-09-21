@@ -103,6 +103,10 @@ pub struct StatusResponse {
     pub token_ttl_secs: Option<u64>,
     /// Number of live serve connections (authorized devices currently connected).
     pub active_connections: usize,
+    /// Per-device rate/concurrency limiters currently cached. One per device
+    /// identity that has connected; reused across reconnects and dropped when a
+    /// device is revoked, so it stays flat for a client that comes and goes.
+    pub cached_limiters: usize,
     /// Relay URLs the endpoint is configured to use.
     pub relay_urls: Vec<String>,
     /// Local socket addresses the endpoint is bound to.

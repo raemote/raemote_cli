@@ -277,6 +277,7 @@ async fn cmd_status(json: bool) -> Result<()> {
             println!("config     : {}", s.config_path);
             println!("paired     : {} device(s)", s.authorized_count);
             println!("connected  : {} live connection(s)", s.active_connections);
+            println!("limiters   : {} cached (one per connected device)", s.cached_limiters);
             println!("discovered : {} app(s)", s.discovered_count);
             match s.token_expires_at_unix {
                 Some(exp) if exp > unix_now() => {
@@ -748,6 +749,14 @@ async fn cmd_doctor(json: bool, verbose: bool) -> Result<()> {
         checks.push(Check::ok(
             "connected",
             format!("{} live connection(s)", s.active_connections),
+        ));
+
+        checks.push(Check::ok(
+            "device state",
+            format!(
+                "{} cached limiter(s) for {} paired device(s)",
+                s.cached_limiters, s.authorized_count
+            ),
         ));
 
         if s.discovered_count == 0 {

@@ -39,6 +39,10 @@ struct DaemonState {
     auth: Arc<AuthState>,
     endpoint: Endpoint,
     active_connections: Arc<AtomicUsize>,
+    /// Per-node rate/concurrency limiters, shared with the serve handler so a
+    /// revoked device's entry can be dropped (a client that merely
+    /// disconnects and reconnects keeps its limiter — that is intended).
+    limiters: crate::http::LimiterRegistry,
     started_at: Instant,
     config_path: std::path::PathBuf,
     shutdown: Arc<Notify>,
@@ -91,6 +95,7 @@ impl IpcHandler for DaemonState {
                     token_expires_at_unix: token_info.as_ref().map(|t| t.expires_at_unix),
                     token_ttl_secs: token_info.as_ref().map(|t| t.ttl.as_secs()),
                     active_connections: self.active_connections.load(Ordering::Relaxed),
+                    cached_limiters: self.limiters.len(),
                     relay_urls: self
                         .endpoint
                         .addr()
@@ -191,6 +196,10 @@ impl IpcHandler for DaemonState {
             Request::RevokeAuthorized { node_id } => match node_id.parse::<iroh::EndpointId>() {
                 Ok(id) => {
                     if self.auth.revoke(id) {
+                        // The device's per-node limiter belongs to an identity
+                        // that will never be authorized again: drop it now
+                        // rather than hold it for the daemon's lifetime.
+                        self.limiters.forget(id);
                         // A pinned pairing token cannot have its value
                         // rotated by the daemon: the owner must unset it or
                         // re-mint deliberately.
@@ -327,6 +336,9 @@ pub async fn run() -> Result<()> {
     let catalog_generation = Arc::new(AtomicU64::new(0));
     let discovery_trigger = Arc::new(Notify::new());
     let active_connections = Arc::new(AtomicUsize::new(0));
+    // Shared with the serve handler: one limiter per device identity, dropped
+    // when that device is revoked.
+    let limiters = crate::http::LimiterRegistry::new();
 
     let state = Arc::new(AppState::with_discovery(
         config.clone(),
@@ -353,6 +365,7 @@ pub async fn run() -> Result<()> {
                 auth.clone(),
                 config_generation.clone(),
                 active_connections.clone(),
+                limiters.clone(),
             ),
         )
         .spawn();
@@ -397,6 +410,7 @@ pub async fn run() -> Result<()> {
         auth,
         endpoint,
         active_connections,
+        limiters,
         started_at: Instant::now(),
         config_path,
         shutdown: shutdown.clone(),

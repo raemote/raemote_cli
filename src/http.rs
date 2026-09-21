@@ -80,6 +80,67 @@ impl NodeLimiter {
     }
 }
 
+/// Cache of per-node limiters, shared between the serve handler and the daemon.
+///
+/// A limiter is created on a node's first authorized connection and **reused
+/// for that node's lifetime**, so a client that disconnects and reconnects —
+/// the normal case for a phone — never accumulates state. The daemon drops a
+/// node's limiter when it revokes the device: that identity is never
+/// authorized again, so its entry would otherwise live until the next config
+/// reload.
+#[derive(Clone, Default)]
+pub struct LimiterRegistry {
+    limiters: Arc<Mutex<HashMap<EndpointId, Arc<NodeLimiter>>>>,
+    /// The config generation the cache was built at; compared against the
+    /// shared `config_generation` to invalidate on reload.
+    generation: Arc<AtomicU64>,
+}
+
+impl LimiterRegistry {
+    /// An empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop one node's limiter (used when its device is revoked).
+    pub fn forget(&self, node: EndpointId) {
+        let removed = self
+            .limiters
+            .lock()
+            .expect("limiters poisoned")
+            .remove(&node);
+        if removed.is_some() {
+            tracing::debug!(node = %node.fmt_short(), "dropped limiter for revoked device");
+        }
+    }
+
+    /// How many limiters are cached (diagnostics and tests).
+    pub fn len(&self) -> usize {
+        self.limiters.lock().expect("limiters poisoned").len()
+    }
+
+    /// Whether no limiter is cached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clear the cache when the config generation advanced (settings such as
+    /// the stream cap or rate limit changed). Returns `true` when it cleared.
+    fn sync_generation(&self, current: u64) -> bool {
+        if self.generation.load(Ordering::Relaxed) == current {
+            return false;
+        }
+        let mut limiters = self.limiters.lock().expect("limiters poisoned");
+        // Re-check under the lock to avoid two threads both clearing.
+        if self.generation.load(Ordering::Relaxed) == current {
+            return false;
+        }
+        limiters.clear();
+        self.generation.store(current, Ordering::Relaxed);
+        true
+    }
+}
+
 /// Handle to the discovery engine, so the HTTP API can trigger a scan.
 #[derive(Clone)]
 pub struct DiscoveryHandle {
@@ -134,10 +195,7 @@ impl AppState {
 pub struct ServeHandler {
     state: Arc<AppState>,
     auth: Arc<AuthState>,
-    limiters: Mutex<HashMap<EndpointId, Arc<NodeLimiter>>>,
-    /// The config generation at which limiters were last created.
-    /// Compared against `config_generation` to invalidate on reload.
-    limiter_generation: AtomicU64,
+    limiters: LimiterRegistry,
     /// Shared config generation counter; incremented on reload.
     config_generation: Arc<AtomicU64>,
     /// Number of live authorized serve connections (for status/diagnostics).
@@ -145,45 +203,36 @@ pub struct ServeHandler {
 }
 
 impl ServeHandler {
-    /// Build a serve handler over shared state and auth.
+    /// Build a serve handler over shared state and auth. `limiters` is shared
+    /// with the daemon so a revoked device's limiter can be dropped.
     pub fn new(
         state: Arc<AppState>,
         auth: Arc<AuthState>,
         config_generation: Arc<AtomicU64>,
         active_connections: Arc<AtomicUsize>,
+        limiters: LimiterRegistry,
     ) -> Self {
         Self {
             state,
             auth,
-            limiters: Mutex::new(HashMap::new()),
-            limiter_generation: AtomicU64::new(0),
+            limiters,
             config_generation,
             active_connections,
         }
     }
 
     fn get_or_create_limiter(&self, node: EndpointId) -> Arc<NodeLimiter> {
-        // Check if config generation changed; if so, clear the cache.
+        // Settings that shape a limiter (stream cap, rate limit) can change on
+        // reload; a stale cache is dropped wholesale.
         let current_gen = self.config_generation.load(Ordering::Relaxed);
-        let last_gen = self.limiter_generation.load(Ordering::Relaxed);
-        if current_gen != last_gen {
-            let mut limiters = self.limiters.lock().expect("limiters poisoned");
-            // Re-check under the lock to avoid races.
-            if self.limiter_generation.load(Ordering::Relaxed) != current_gen {
-                limiters.clear();
-                self.limiter_generation.store(current_gen, Ordering::Relaxed);
-                tracing::debug!(
-                    old_gen = last_gen,
-                    new_gen = current_gen,
-                    "cleared limiter cache on config reload"
-                );
-            }
+        if self.limiters.sync_generation(current_gen) {
+            tracing::debug!(generation = current_gen, "cleared limiter cache on config reload");
         }
 
         let cfg = self.state.config.read().expect("config poisoned");
         let serve = &cfg.serve;
 
-        let mut limiters = self.limiters.lock().expect("limiters poisoned");
+        let mut limiters = self.limiters.limiters.lock().expect("limiters poisoned");
         limiters
             .entry(node)
             .or_insert_with(|| {
@@ -1092,6 +1141,20 @@ mod tests {
         iroh::SecretKey::from_bytes(&[7; 32]).public()
     }
 
+    fn test_handler() -> ServeHandler {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let catalog = Arc::new(RwLock::new(Catalog::empty()));
+        let state = Arc::new(AppState::new(config, catalog, test_node_id()));
+        let auth = Arc::new(AuthState::load(10).unwrap());
+        ServeHandler::new(
+            state,
+            auth,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            LimiterRegistry::new(),
+        )
+    }
+
     #[test]
     fn error_body_has_code_and_optional_hint() {
         let with_hint = error_body("unknown_app", "unknown app \"x\"", Some("refresh the list"));
@@ -1229,17 +1292,7 @@ mod tests {
 
     #[test]
     fn serve_handler_get_or_create_limiter() {
-        let config = Arc::new(RwLock::new(Config::default()));
-        let catalog = Arc::new(RwLock::new(Catalog::empty()));
-        let state = Arc::new(AppState::new(config, catalog, test_node_id()));
-        let auth = Arc::new(AuthState::load(10).unwrap());
-        let config_generation = Arc::new(AtomicU64::new(0));
-        let handler = ServeHandler::new(
-            state,
-            auth,
-            config_generation,
-            Arc::new(AtomicUsize::new(0)),
-        );
+        let handler = test_handler();
         let node_a = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let node_b = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let limiter_a1 = handler.get_or_create_limiter(node_a);
@@ -1247,6 +1300,40 @@ mod tests {
         let limiter_b = handler.get_or_create_limiter(node_b);
         assert!(Arc::ptr_eq(&limiter_a1, &limiter_a2));
         assert!(!Arc::ptr_eq(&limiter_a1, &limiter_b));
+    }
+
+    /// A client comes and goes constantly: reconnecting must reuse the one
+    /// limiter for that node, never accumulate one per connection.
+    #[test]
+    fn reconnecting_reuses_one_limiter_per_node() {
+        let handler = test_handler();
+        let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let first = handler.get_or_create_limiter(node);
+        for _ in 0..25 {
+            let again = handler.get_or_create_limiter(node);
+            assert!(Arc::ptr_eq(&first, &again));
+        }
+        assert_eq!(handler.limiters.len(), 1, "one entry per device identity");
+    }
+
+    /// Revoking a device drops its limiter: the identity is not authorized
+    /// again, so holding it would leak for the daemon's lifetime.
+    #[test]
+    fn revoking_forgets_the_nodes_limiter() {
+        let handler = test_handler();
+        let revoked = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let kept = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        handler.get_or_create_limiter(revoked);
+        let kept_limiter = handler.get_or_create_limiter(kept);
+        assert_eq!(handler.limiters.len(), 2);
+
+        handler.limiters.forget(revoked);
+        assert_eq!(handler.limiters.len(), 1);
+        // The other device keeps its limiter (and therefore its rate state).
+        assert!(Arc::ptr_eq(
+            &handler.get_or_create_limiter(kept),
+            &kept_limiter
+        ));
     }
 
     #[test]
@@ -1261,6 +1348,7 @@ mod tests {
             auth,
             config_generation.clone(),
             Arc::new(AtomicUsize::new(0)),
+            LimiterRegistry::new(),
         );
 
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
