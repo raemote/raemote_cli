@@ -6,6 +6,11 @@
 //! tags (`og:title`, `twitter:title`, `application-name`,
 //! `apple-mobile-web-app-title`) — which catch single-page apps whose title is
 //! set by JavaScript.
+//!
+//! It also resolves the best declared icon (`apple-touch-icon` first, then
+//! `icon`/`shortcut icon`) to a **same-origin path**, so a client can fetch it
+//! through the app's `/app/{name}` route. Raster icons are preferred over
+//! `sizes="any"` (SVG) — see [`IconRel`].
 
 use std::time::Duration;
 
@@ -33,6 +38,10 @@ pub struct ProbeResult {
     pub title: Option<String>,
     /// `Server` response header, when present.
     pub server: Option<String>,
+    /// Same-origin path of the best declared icon (e.g. `/favicon.ico`,
+    /// `/assets/icon.png`), resolved against the final document path. `None`
+    /// when the page declares no icon.
+    pub icon: Option<String>,
 }
 
 /// Probe `origin` with a bounded `GET /` (following same-origin redirects) and
@@ -54,16 +63,24 @@ pub async fn probe_http(origin: &Origin, budget: Duration) -> Option<ProbeResult
 
         if (300..400).contains(&response.status)
             && let Some(location) = response.location.as_deref()
-            && let Some(next) = redirect_path(origin, &path, location)
+            && let Some(next) = same_origin_path(origin, &path, location)
         {
             path = next;
             continue;
         }
 
+        // Resolve the declared icon against the path this final response came
+        // from (a redirect may move the document into a subdirectory).
+        let icon = response
+            .icon_href
+            .as_deref()
+            .and_then(|href| same_origin_path(origin, &path, href));
+
         return Some(ProbeResult {
             status: response.status,
             title: response.title,
             server: response.server,
+            icon,
         });
     }
 
@@ -76,6 +93,8 @@ struct RawResponse {
     location: Option<String>,
     server: Option<String>,
     title: Option<String>,
+    /// Raw `href` of the best declared icon, before same-origin resolution.
+    icon_href: Option<String>,
 }
 
 async fn request(origin: &Origin, path: &str, budget: Duration) -> Option<RawResponse> {
@@ -172,13 +191,15 @@ fn parse_response(buf: &[u8]) -> Option<RawResponse> {
         location,
         server,
         title: extract_name(body),
+        icon_href: extract_icon(body),
     })
 }
 
-/// Follow a redirect target, but only within the same host and port (never
-/// make the server fetch an arbitrary address). Scheme differences are ignored
-/// because Raemote only speaks HTTP.
-fn redirect_path(origin: &Origin, base_path: &str, location: &str) -> Option<String> {
+/// Resolve a URL (a redirect `Location` or an icon `href`) against the current
+/// document path, but only within the same host and port (never make the
+/// server fetch an arbitrary address). Scheme differences are ignored because
+/// Raemote only speaks HTTP. Returns a path-and-query string starting with `/`.
+fn same_origin_path(origin: &Origin, base_path: &str, location: &str) -> Option<String> {
     let base = format!(
         "{}://{}{}",
         origin.scheme.as_str(),
@@ -204,6 +225,105 @@ fn redirect_path(origin: &Origin, base_path: &str, location: &str) -> Option<Str
         path.push_str(query);
     }
     Some(path)
+}
+
+/// Icon `rel` categories, in preference order (best first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconRel {
+    /// `apple-touch-icon` / `apple-touch-icon-precomposed`: opaque, home-screen
+    /// sized — the best match for a web-app icon.
+    AppleTouchIcon,
+    /// `icon` / `shortcut icon`: the general favicon.
+    Icon,
+}
+
+/// Categorize a `rel` attribute (a space-separated token list, e.g.
+/// `"shortcut icon"`). `mask-icon` (Safari pinned-tab, monochrome SVG) is
+/// deliberately ignored.
+fn rel_category(rel: &str) -> Option<IconRel> {
+    let mut apple = false;
+    let mut icon = false;
+    for token in rel.split_whitespace() {
+        if token.eq_ignore_ascii_case("apple-touch-icon")
+            || token.eq_ignore_ascii_case("apple-touch-icon-precomposed")
+        {
+            apple = true;
+        } else if token.eq_ignore_ascii_case("icon") {
+            icon = true;
+        }
+    }
+    if apple {
+        Some(IconRel::AppleTouchIcon)
+    } else if icon {
+        Some(IconRel::Icon)
+    } else {
+        None
+    }
+}
+
+/// Largest pixel area a `sizes` attribute declares. Missing `sizes` counts as
+/// 1 (declared but unsized), while `any` (SVG) counts as 0 so a raster icon of
+/// the same category wins — clients cannot rasterize SVG.
+fn sizes_area(sizes: Option<&str>) -> u32 {
+    let Some(sizes) = sizes else { return 1 };
+    let mut best = 0;
+    for part in sizes.split_whitespace() {
+        if let Some((w, h)) = part.split_once(['x', 'X']) {
+            let area = w.trim().parse::<u32>().unwrap_or(0) * h.trim().parse::<u32>().unwrap_or(0);
+            best = best.max(area);
+        }
+    }
+    best
+}
+
+/// The best declared icon `href` in an HTML byte slice: prefer
+/// `apple-touch-icon`, then `icon`; within a category prefer the largest
+/// `sizes` (raster over `any`).
+fn extract_icon(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let lower = text.to_ascii_lowercase();
+    let mut best: Option<(IconRel, u32, String)> = None;
+    let mut search = 0;
+
+    while let Some(offset) = lower[search..].find("<link") {
+        let start = search + offset;
+        let Some(end) = text[start..].find('>').map(|i| start + i + 1) else {
+            break;
+        };
+        let tag = &text[start..end];
+
+        if let Some(rel) = attribute_value(tag, "rel")
+            && let Some(category) = rel_category(&rel)
+            && let Some(href) = attribute_value(tag, "href")
+            && !href.trim().is_empty()
+        {
+            let area = sizes_area(attribute_value(tag, "sizes").as_deref());
+            // Better than the current pick: a higher-preference category, or
+            // the same category with a larger area.
+            let better = match &best {
+                None => true,
+                Some((best_rel, best_area, _)) => {
+                    category_rank(category) > category_rank(*best_rel)
+                        || (category == *best_rel && area > *best_area)
+                }
+            };
+            if better {
+                best = Some((category, area, href));
+            }
+        }
+
+        search = end;
+    }
+
+    best.map(|(_, _, href)| href)
+}
+
+/// Preference rank for an icon category (higher wins).
+fn category_rank(category: IconRel) -> u8 {
+    match category {
+        IconRel::AppleTouchIcon => 1,
+        IconRel::Icon => 0,
+    }
 }
 
 /// Best available display name for the page: `<title>`, else a common meta
@@ -461,16 +581,16 @@ mod tests {
     fn redirect_stays_on_the_same_origin() {
         let origin = Origin::http("127.0.0.1", 8096);
         assert_eq!(
-            redirect_path(&origin, "/", "/web/index.html").as_deref(),
+            same_origin_path(&origin, "/", "/web/index.html").as_deref(),
             Some("/web/index.html")
         );
         assert_eq!(
-            redirect_path(&origin, "/", "http://127.0.0.1:8096/a?b=c").as_deref(),
+            same_origin_path(&origin, "/", "http://127.0.0.1:8096/a?b=c").as_deref(),
             Some("/a?b=c")
         );
         // Different host or port is not followed.
-        assert!(redirect_path(&origin, "/", "http://evil.example/").is_none());
-        assert!(redirect_path(&origin, "/", "http://127.0.0.1:9999/").is_none());
+        assert!(same_origin_path(&origin, "/", "http://evil.example/").is_none());
+        assert!(same_origin_path(&origin, "/", "http://127.0.0.1:9999/").is_none());
     }
 
     #[test]
@@ -495,5 +615,79 @@ mod tests {
         );
         // Doesn't match a substring attribute like `data-name`.
         assert_eq!(attribute_value("<meta data-name=\"y\">", "name"), None);
+    }
+
+    #[tokio::test]
+    async fn probe_resolves_a_relative_icon_path() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>A</title><link rel=\"icon\" href=\"/static/icon.png\"></head></html>";
+        let port = serve_routes(vec![("/", response)]).await;
+        let origin = Origin::http("127.0.0.1", port);
+        let result = probe_http(&origin, Duration::from_millis(1000))
+            .await
+            .expect("should probe");
+        assert_eq!(result.icon.as_deref(), Some("/static/icon.png"));
+    }
+
+    #[tokio::test]
+    async fn probe_prefers_apple_touch_icon_over_icon() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>A</title><link rel=\"icon\" href=\"/f.ico\"><link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"/apple.png\"></head></html>";
+        let port = serve_routes(vec![("/", response)]).await;
+        let origin = Origin::http("127.0.0.1", port);
+        let result = probe_http(&origin, Duration::from_millis(1000))
+            .await
+            .expect("should probe");
+        assert_eq!(result.icon.as_deref(), Some("/apple.png"));
+    }
+
+    #[tokio::test]
+    async fn probe_prefers_the_largest_raster_icon_over_svg() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>A</title><link rel=\"icon\" sizes=\"any\" href=\"/icon.svg\"><link rel=\"icon\" sizes=\"32x32\" href=\"/small.png\"><link rel=\"icon\" sizes=\"180x180\" href=\"/big.png\"></head></html>";
+        let port = serve_routes(vec![("/", response)]).await;
+        let origin = Origin::http("127.0.0.1", port);
+        let result = probe_http(&origin, Duration::from_millis(1000))
+            .await
+            .expect("should probe");
+        assert_eq!(result.icon.as_deref(), Some("/big.png"));
+    }
+
+    #[tokio::test]
+    async fn probe_resolves_icon_against_the_redirected_path() {
+        let routes = vec![
+            ("/", "HTTP/1.1 302 Found\r\nLocation: /web/\r\nContent-Length: 0\r\n\r\n"),
+            (
+                "/web/",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>A</title><link rel=\"icon\" href=\"icon.png\"></head></html>",
+            ),
+        ];
+        let port = serve_routes(routes).await;
+        let origin = Origin::http("127.0.0.1", port);
+        let result = probe_http(&origin, Duration::from_millis(1500))
+            .await
+            .expect("should probe");
+        assert_eq!(result.icon.as_deref(), Some("/web/icon.png"));
+    }
+
+    #[tokio::test]
+    async fn probe_drops_a_cross_origin_icon() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>A</title><link rel=\"icon\" href=\"https://cdn.example/icon.png\"></head></html>";
+        let port = serve_routes(vec![("/", response)]).await;
+        let origin = Origin::http("127.0.0.1", port);
+        let result = probe_http(&origin, Duration::from_millis(1000))
+            .await
+            .expect("should probe");
+        assert_eq!(result.icon, None);
+    }
+
+    #[test]
+    fn extract_icon_handles_shortcut_rel_and_no_declaration() {
+        assert_eq!(
+            extract_icon(b"<link rel=\"shortcut icon\" href=\"/f.ico\">").as_deref(),
+            Some("/f.ico")
+        );
+        assert_eq!(
+            extract_icon(b"<link rel=\"mask-icon\" href=\"/mask.svg\">"),
+            None
+        );
+        assert_eq!(extract_icon(b"<html><head></head></html>"), None);
     }
 }

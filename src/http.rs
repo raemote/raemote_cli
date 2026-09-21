@@ -439,21 +439,21 @@ async fn discover(state: &AppState) -> Response<ResBody> {
 
 fn catalog(state: &AppState) -> Response<ResBody> {
     let catalog = state.catalog.read().expect("catalog poisoned");
-    let apps: Vec<_> = catalog
-        .apps()
-        .iter()
-        .map(|app| {
-            serde_json::json!({
-                "name": app.name,
-                "path": format!("/app/{}", app.name),
-                "port": app.origin.port,
-                "scheme": app.origin.scheme.as_str(),
-                "source": app.source.as_str(),
-                "title": app.title,
-            })
-        })
-        .collect();
+    let apps: Vec<_> = catalog.apps().iter().map(catalog_app_json).collect();
     json_response(StatusCode::OK, serde_json::json!({ "apps": apps }))
+}
+
+/// One catalog entry in the hub JSON shape the client decodes.
+fn catalog_app_json(app: &crate::catalog::CatalogApp) -> serde_json::Value {
+    serde_json::json!({
+        "name": app.name,
+        "path": format!("/app/{}", app.name),
+        "port": app.origin.port,
+        "scheme": app.origin.scheme.as_str(),
+        "source": app.source.as_str(),
+        "title": app.title,
+        "icon": app.icon,
+    })
 }
 
 /// `GET /_hub/info`: basic server identity for the app to display.
@@ -1102,6 +1102,38 @@ mod tests {
         let without_hint = error_body("not_found", "no such route", None);
         assert_eq!(without_hint["code"], "not_found");
         assert!(without_hint.get("hint").is_none());
+    }
+
+    #[test]
+    fn catalog_json_carries_the_discovered_icon_and_omits_it_for_manual_apps() {
+        use crate::catalog::Catalog;
+        use crate::discovery::model::{DiscoveredApp, Origin};
+
+        let catalog = Catalog::rebuild(
+            &[],
+            &[DiscoveredApp {
+                origin: Origin::http("127.0.0.1", 3000),
+                title: Some("My App".into()),
+                icon: Some("/icons/app.png".into()),
+                process: Some("node".into()),
+                pid: Some(1),
+            }],
+        );
+        let json = catalog_app_json(&catalog.apps()[0]);
+        assert_eq!(json["name"], "my-app");
+        assert_eq!(json["icon"], "/icons/app.png");
+
+        // Manual apps are not probed, so they carry no icon (the client then
+        // falls back to `/favicon.ico`).
+        let manual = Catalog::rebuild(
+            &[crate::config::AppConfig {
+                name: "manual".into(),
+                port: 8080,
+            }],
+            &[],
+        );
+        let json = catalog_app_json(&manual.apps()[0]);
+        assert!(json["icon"].is_null());
     }
 
     #[test]

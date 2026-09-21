@@ -133,6 +133,8 @@ pub struct AppInfoResponse {
     pub source: String,
     /// Page title, when known.
     pub title: Option<String>,
+    /// Same-origin path of the app's declared icon, when known.
+    pub icon: Option<String>,
     /// Owning process name, when known.
     pub process: Option<String>,
 }

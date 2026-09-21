@@ -180,6 +180,7 @@ impl DiscoveryEngine {
                                 app: DiscoveredApp {
                                     origin: candidate.origin,
                                     title: result.title,
+                                    icon: result.icon,
                                     process: candidate.process,
                                     pid: candidate.pid,
                                 },
@@ -303,6 +304,7 @@ mod tests {
             status,
             title: title.map(str::to_string),
             server: None,
+            icon: None,
         }
     }
 

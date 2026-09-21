@@ -116,6 +116,8 @@ pub struct DiscoveredApp {
     pub origin: Origin,
     /// Page title, when the probe found one.
     pub title: Option<String>,
+    /// Same-origin path of the page's declared icon, when one was found.
+    pub icon: Option<String>,
     /// Owning process name, when known.
     pub process: Option<String>,
     /// Owning process id, when known.

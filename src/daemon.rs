@@ -59,6 +59,7 @@ impl DaemonState {
                 scheme: app.origin.scheme.as_str().to_string(),
                 source: app.source.as_str().to_string(),
                 title: app.title.clone(),
+                icon: app.icon.clone(),
                 process: app.process.clone(),
             })
             .collect()

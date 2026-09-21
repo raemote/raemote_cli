@@ -1204,9 +1204,10 @@ fn print_apps(apps: &[AppInfoResponse]) {
     for app in apps {
         let title = app.title.as_deref().unwrap_or("-");
         let process = app.process.as_deref().unwrap_or("-");
+        let icon = app.icon.as_deref().unwrap_or("-");
         println!(
-            "{:<24} {:<10} {}://{}:{}  title={}  process={}",
-            app.name, app.source, app.scheme, app.host, app.port, title, process
+            "{:<24} {:<10} {}://{}:{}  title={}  icon={}  process={}",
+            app.name, app.source, app.scheme, app.host, app.port, title, icon, process
         );
     }
 }

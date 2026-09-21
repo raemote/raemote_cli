@@ -38,6 +38,9 @@ pub struct CatalogApp {
     pub name: String,
     /// Page title, when known (discovered apps only).
     pub title: Option<String>,
+    /// Same-origin path of the app's declared icon, when known (discovered
+    /// apps only). Manual apps have no probe, so this is `None` for them.
+    pub icon: Option<String>,
     /// Where the app is reachable.
     pub origin: Origin,
     /// Whether the entry came from config or discovery.
@@ -108,6 +111,7 @@ impl Catalog {
             apps.push(CatalogApp {
                 name: app.name.clone(),
                 title: None,
+                icon: None,
                 origin,
                 source: AppSource::Manual,
                 process: None,
@@ -168,6 +172,7 @@ impl Catalog {
             apps.push(CatalogApp {
                 name,
                 title: d.title.clone(),
+                icon: d.icon.clone(),
                 origin: d.origin.clone(),
                 source: AppSource::Discovered,
                 process: d.process.clone(),
@@ -275,6 +280,7 @@ mod tests {
         DiscoveredApp {
             origin: Origin::http("127.0.0.1", port),
             title: Some(title.to_string()),
+            icon: None,
             process: Some("node".to_string()),
             pid: Some(1),
         }
