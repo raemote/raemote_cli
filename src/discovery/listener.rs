@@ -123,8 +123,15 @@ pub const BUILTIN_EXCLUDE_PORTS: &[u16] = &[
 ///
 /// Deliberately conservative: only names that are essentially always a proxy or
 /// tunnel. `docker-proxy` is intentionally **not** listed, because Docker
-/// publishes real web apps through it.
+/// publishes real web apps through it. `raemote`/`raemoted` are Raemote's own
+/// control-plane binaries — critically, the local listeners of `raemote
+/// connect` (its index and per-app ports), which proxy rather than serve: if
+/// they were catalogued, a connector running on the server machine would see
+/// its own ports appear as new apps and bind listeners for those in turn, a
+/// loop that grows every discovery cycle.
 pub const BUILTIN_EXCLUDE_PROCESSES: &[&str] = &[
+    "raemote",
+    "raemoted",
     "xray",
     "v2ray",
     "v2ray-core",
@@ -476,6 +483,22 @@ mod tests {
             "xray",
         )];
         assert!(filter_listeners(&all, &filter()).is_empty());
+    }
+
+    #[test]
+    fn skips_raemote_connect_listeners() {
+        // The connector's own index and per-app ports must never be
+        // catalogued: a `raemote connect` running on the server machine would
+        // otherwise see its own listeners appear as new apps and bind
+        // listeners for those in turn — a loop growing every discovery cycle.
+        let all = vec![
+            listener("127.0.0.1:7793", Protocol::TCP, SocketState::Listen, "raemote"),
+            listener("127.0.0.1:7790", Protocol::TCP, SocketState::Listen, "raemote"),
+            listener("127.0.0.1:5173", Protocol::TCP, SocketState::Listen, "node"),
+        ];
+        let got = filter_listeners(&all, &filter());
+        assert_eq!(got.len(), 1, "only the real web app survives");
+        assert_eq!(got[0].origin.port, 5173);
     }
 
     #[test]
