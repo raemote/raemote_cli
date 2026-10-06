@@ -2,21 +2,26 @@
 //!
 //! [`run`] pairs this machine's CLI identity with a remote `raemoted` (when a
 //! `raemote://bind?…` URI is given), then serves a tiny embedded web UI on
-//! `127.0.0.1` that lists the server's apps and proxies every request to them
-//! over the same iroh connection the iOS app uses. It is deliberately minimal:
-//! one iroh endpoint, one QUIC connection reused across requests, a hand-rolled
-//! HTTP/1.1 pump for app traffic (no extra dependencies, bodies and WebSockets
-//! stream through untouched), and a single embedded HTML template with no
-//! JavaScript.
+//! `127.0.0.1:<port>` that lists the server's apps and proxies every request to
+//! them over the same iroh connection the iOS app uses. The index is only the
+//! launcher: **each app gets its own stable loopback port** (allocated from
+//! `APP_PORT_FIRST..=APP_PORT_LAST` and persisted in `connector.json`) whose
+//! whole origin maps to the app's root, so relative *and* root-absolute URLs,
+//! cookies and site data behave exactly as they do on the server — the same
+//! scheme the iOS app uses. It is deliberately minimal: one iroh endpoint, one
+//! QUIC connection reused across requests, a hand-rolled HTTP/1.1 pump for app
+//! traffic (no extra dependencies, bodies and WebSockets stream through
+//! untouched), and a single embedded HTML template with no JavaScript.
 //!
-//! The local listener answers only requests whose `Host` is
-//! `127.0.0.1:<port>` (DNS-rebinding protection) and holds no secrets of its
-//! own — access control is the server's device authorization, keyed by this
-//! machine's `~/.raemote/client.key` identity.
+//! Each local listener answers only requests whose `Host` is
+//! `127.0.0.1:<its port>` (DNS-rebinding protection) and holds no secrets of
+//! its own — access control is the server's device authorization, keyed by
+//! this machine's `~/.raemote/client.key` identity.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -39,6 +44,12 @@ const BIND_ALPN: &[u8] = b"raemote/bind/0";
 
 /// Default port for the local web UI (`--port` overrides it).
 pub const DEFAULT_PORT: u16 = 7788;
+
+/// Inclusive range each app's own loopback port is allocated from. The index
+/// keeps `--port`; an app's port is stable (persisted, keyed `node/app`) so its
+/// origin — and with it cookies and site data — survives reconnects.
+const APP_PORT_FIRST: u16 = 7790;
+const APP_PORT_LAST: u16 = 7999;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
@@ -80,6 +91,7 @@ pub async fn run(target: Option<&str>, port: u16, open: bool) -> Result<()> {
     if let Err(err) = save_last(node, &info.name) {
         eprintln!("warning: could not remember this server: {err:#}");
     }
+    let ports = Arc::new(AppPorts::new(node, port, state_path()?));
 
     let url = format!("http://127.0.0.1:{port}");
     println!("Raemote Connector — {}", info.name);
@@ -89,7 +101,7 @@ pub async fn run(target: Option<&str>, port: u16, open: bool) -> Result<()> {
         open_browser(&url);
     }
 
-    serve(remote, port).await
+    serve(remote, ports, port).await
 }
 
 /// `raemote://bind?node=<id>&token=<hex>&exp=<unix>` → `(node id, token)`.
@@ -140,11 +152,15 @@ fn resolve_target(target: Option<&str>) -> Result<(EndpointId, Option<String>)> 
 // Last-used server state
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct LastServer {
     node: String,
     #[serde(default)]
     name: Option<String>,
+    /// Stable per-app loopback ports, keyed `"<node-id>/<app-name>"` so two
+    /// servers running the same app name never share an origin.
+    #[serde(default)]
+    ports: HashMap<String, u16>,
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -155,10 +171,19 @@ fn load_last() -> Option<EndpointId> {
     load_last_from(&state_path().ok()?)
 }
 
-fn load_last_from(path: &Path) -> Option<EndpointId> {
+fn read_state(path: &Path) -> Option<LastServer> {
     let text = std::fs::read_to_string(path).ok()?;
-    let state: LastServer = serde_json::from_str(&text).ok()?;
-    EndpointId::from_str(&state.node).ok()
+    serde_json::from_str(&text).ok()
+}
+
+fn write_state(path: &Path, state: &LastServer) -> Result<()> {
+    let json = serde_json::to_string_pretty(state)?;
+    std::fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn load_last_from(path: &Path) -> Option<EndpointId> {
+    EndpointId::from_str(&read_state(path)?.node).ok()
 }
 
 fn save_last(node: EndpointId, name: &str) -> Result<()> {
@@ -167,14 +192,13 @@ fn save_last(node: EndpointId, name: &str) -> Result<()> {
     save_last_to(&path, node, name)
 }
 
+/// Remember the server, preserving any per-app port assignments already on
+/// disk (they are keyed by node, so another server's map round-trips too).
 fn save_last_to(path: &Path, node: EndpointId, name: &str) -> Result<()> {
-    let state = LastServer {
-        node: node.to_string(),
-        name: Some(name.to_string()),
-    };
-    let json = serde_json::to_string_pretty(&state)?;
-    std::fs::write(path, json).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    let mut state = read_state(path).unwrap_or_default();
+    state.node = node.to_string();
+    state.name = Some(name.to_string());
+    write_state(path, &state)
 }
 
 // ---------------------------------------------------------------------------
@@ -390,24 +414,240 @@ async fn fetch_info(remote: &Remote) -> Result<ServerInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-app loopback ports
+// ---------------------------------------------------------------------------
+
+/// Stable loopback ports for the apps themselves.
+///
+/// The index lives on `--port`; every app gets its own port whose entire
+/// origin maps to the app's root (`/x` on this port is forwarded as
+/// `/app/<name>/x`), exactly like the iOS app's per-app proxy ports. That is
+/// what makes both relative and root-absolute URLs inside a page resolve to
+/// the right app, and it keeps two apps' cookies and site data from sharing
+/// one origin. Assignments are persisted in `connector.json` under the key
+/// `<node-id>/<app-name>` so they are stable across runs and never collide
+/// across servers.
+struct AppPorts {
+    node: EndpointId,
+    index_port: u16,
+    state_path: PathBuf,
+    first: u16,
+    last: u16,
+    inner: Mutex<PortsInner>,
+}
+
+#[derive(Default)]
+struct PortsInner {
+    /// Persisted assignments (all nodes' entries are preserved; only ours are
+    /// added or replaced).
+    stored: HashMap<String, u16>,
+    /// Apps that have a live listener this run.
+    live: HashMap<String, u16>,
+    /// Every local port already taken by one of our listeners.
+    bound: HashSet<u16>,
+}
+
+/// A freshly bound app listener awaiting its accept loop: (app, port, socket).
+type PendingListener = (String, u16, std::net::TcpListener);
+
+impl AppPorts {
+    fn new(node: EndpointId, index_port: u16, state_path: PathBuf) -> Self {
+        let stored = read_state(&state_path)
+            .map(|state| state.ports)
+            .unwrap_or_default();
+        Self {
+            node,
+            index_port,
+            state_path,
+            first: APP_PORT_FIRST,
+            last: APP_PORT_LAST,
+            inner: Mutex::new(PortsInner {
+                stored,
+                ..PortsInner::default()
+            }),
+        }
+    }
+
+    fn key(&self, app: &str) -> String {
+        format!("{}/{}", self.node, app)
+    }
+
+    /// The port an app of *this* server is being served on right now.
+    fn live_port(&self, app: &str) -> Option<u16> {
+        self.inner
+            .lock()
+            .expect("ports poisoned")
+            .live
+            .get(&self.key(app))
+            .copied()
+    }
+
+    /// Give every app in `apps` a listener (allocating and persisting ports as
+    /// needed) and return the name→port map the index renders links from. An
+    /// app with no free port is simply absent — its link falls back to the
+    /// path-form `/app/<name>` on the index port.
+    fn ensure(&self, remote: &Arc<Remote>, apps: &[CatalogEntry]) -> HashMap<String, u16> {
+        let (map, pending) = self.assign_all(apps);
+        for (name, port, listener) in pending {
+            let listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    eprintln!("warning: could not serve app {name}: {err}");
+                    continue;
+                }
+            };
+            let remote = remote.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (rd, wr) = sock.into_split();
+                    let remote = remote.clone();
+                    let name = name.clone();
+                    tokio::spawn(async move {
+                        handle_conn(rd, wr, remote, port, Route::App(name)).await;
+                    });
+                }
+            });
+        }
+        map
+    }
+
+    /// The allocation half of [`ensure`](Self::ensure): bind a port for every
+    /// app that doesn't have one yet, persist any changes, and return the
+    /// name→port map plus the listeners still to be spawned (split out so the
+    /// port logic is unit-testable without an iroh endpoint).
+    fn assign_all(
+        &self,
+        apps: &[CatalogEntry],
+    ) -> (HashMap<String, u16>, Vec<PendingListener>) {
+        let mut pending = Vec::new();
+        let mut changed = false;
+        let (map, stored) = {
+            let mut inner = self.inner.lock().expect("ports poisoned");
+            for app in apps {
+                let key = self.key(&app.name);
+                if inner.live.contains_key(&key) {
+                    continue;
+                }
+                let before = inner.stored.get(&key).copied();
+                let Some(listener) = self.assign(&mut inner, &key) else {
+                    continue;
+                };
+                let port = inner.live[&key];
+                if before != Some(port) {
+                    changed = true;
+                }
+                pending.push((app.name.clone(), port, listener));
+            }
+            let map = apps
+                .iter()
+                .filter_map(|app| {
+                    inner
+                        .live
+                        .get(&self.key(&app.name))
+                        .map(|&port| (app.name.clone(), port))
+                })
+                .collect();
+            let stored = if changed {
+                Some(inner.stored.clone())
+            } else {
+                None
+            };
+            (map, stored)
+        };
+        if let Some(ports) = stored {
+            let mut state = read_state(&self.state_path).unwrap_or_default();
+            state.ports = ports;
+            if let Err(err) = write_state(&self.state_path, &state) {
+                eprintln!("warning: could not remember app ports: {err:#}");
+            }
+        }
+        (map, pending)
+    }
+
+    /// Pick a port for `key` and bind it, recording the assignment. The stored
+    /// (previous) port is tried first for origin stability; otherwise the
+    /// first free port in the range that collides with neither our listeners,
+    /// the index, nor any other stored assignment is used.
+    fn assign(&self, inner: &mut PortsInner, key: &str) -> Option<std::net::TcpListener> {
+        let mut candidates = Vec::new();
+        if let Some(&stored) = inner.stored.get(key) {
+            candidates.push(stored);
+        }
+        for port in self.first..=self.last {
+            let foreign = inner.stored.values().any(|&other| other == port);
+            if port != self.index_port && !inner.bound.contains(&port) && !foreign {
+                candidates.push(port);
+            }
+        }
+        for port in candidates {
+            if port == self.index_port || inner.bound.contains(&port) {
+                continue;
+            }
+            let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+                continue;
+            };
+            if listener.set_nonblocking(true).is_err() {
+                continue;
+            }
+            if inner.stored.get(key) != Some(&port) {
+                inner.stored.insert(key.to_string(), port);
+            }
+            inner.live.insert(key.to_string(), port);
+            inner.bound.insert(port);
+            return Some(listener);
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Local server
 // ---------------------------------------------------------------------------
 
-async fn serve(remote: Arc<Remote>, port: u16) -> Result<()> {
+async fn serve(remote: Arc<Remote>, ports: Arc<AppPorts>, port: u16) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .with_context(|| format!("cannot listen on 127.0.0.1:{port} — already in use? try --port"))?;
     loop {
         let (sock, _) = listener.accept().await?;
         let remote = remote.clone();
+        let ports = ports.clone();
         let (rd, wr) = sock.into_split();
         tokio::spawn(async move {
-            handle_conn(rd, wr, remote, port).await;
+            handle_conn(rd, wr, remote, port, Route::Index(ports)).await;
         });
     }
 }
 
-async fn handle_conn(mut rd: OwnedReadHalf, wr: OwnedWriteHalf, remote: Arc<Remote>, port: u16) {
+/// What a local listener serves: the index (and legacy `/app/…` links) on
+/// `--port`, or one app's whole origin on its own port.
+enum Route {
+    Index(Arc<AppPorts>),
+    /// An app's own port: every path is forwarded under `/app/<name>/…`.
+    App(String),
+}
+
+/// The origin-form target a request on an app's own port is forwarded as: the
+/// app's whole origin maps to `/app/<name>/`, so relative *and* root-absolute
+/// URLs inside the page reach the right app (`/` → `/app/<name>/`, matching
+/// what the server proxies as the origin root).
+fn app_target(name: &str, path: &str, query: &str) -> String {
+    let mut target = if path == "/" {
+        format!("/app/{name}/")
+    } else {
+        format!("/app/{name}{path}")
+    };
+    if !query.is_empty() {
+        target.push('?');
+        target.push_str(query);
+    }
+    target
+}
+
+async fn handle_conn(mut rd: OwnedReadHalf, wr: OwnedWriteHalf, remote: Arc<Remote>, port: u16, route: Route) {
     let mut wr = wr;
     let buf = match read_head(&mut rd).await {
         Some(buf) => buf,
@@ -420,7 +660,7 @@ async fn handle_conn(mut rd: OwnedReadHalf, wr: OwnedWriteHalf, remote: Arc<Remo
     let raw = String::from_utf8_lossy(&buf[..head_end]).into_owned();
     let leftover = buf[head_end + 4..].to_vec();
 
-    let Some(head) = parse_head(&raw) else {
+    let Some(mut head) = parse_head(&raw) else {
         let _ = write_error(&mut wr, "400 Bad Request", "malformed request").await;
         return;
     };
@@ -435,12 +675,28 @@ async fn handle_conn(mut rd: OwnedReadHalf, wr: OwnedWriteHalf, remote: Arc<Remo
     }
 
     let (path, query) = split_query(&head.target);
-    if path == "/" {
-        let refresh = query.split('&').any(|param| param == "refresh=1");
-        handle_index(&mut wr, &remote, refresh, head.method == "HEAD").await;
-        return;
+    match route {
+        Route::App(name) => {
+            head.set_target(&app_target(&name, path, query));
+            forward(rd, &mut wr, &remote, head, leftover).await;
+        }
+        Route::Index(ports) => {
+            if path == "/" {
+                let refresh = query.split('&').any(|param| param == "refresh=1");
+                handle_index(&mut wr, &remote, &ports, refresh, head.method == "HEAD").await;
+                return;
+            }
+            if let Some(rest) = path.strip_prefix("/app/") {
+                let app_name = rest.split('/').next().unwrap_or(rest);
+                let port = ports.live_port(app_name);
+                if let Some(location) = redirect_location(rest, query, port) {
+                    let _ = write_redirect(&mut wr, &location).await;
+                    return;
+                }
+            }
+            forward(rd, &mut wr, &remote, head, leftover).await;
+        }
     }
-    forward(rd, &mut wr, &remote, head, leftover).await;
 }
 
 /// Read through to the end of the request head (bounded and timed).
@@ -469,9 +725,19 @@ struct Head {
     first_line: String,
     method: String,
     target: String,
+    version: String,
     headers: Vec<String>,
     upgrade: bool,
     has_body: bool,
+}
+
+impl Head {
+    /// Point the request at a different origin-form target (used to mount an
+    /// app's whole origin under `/app/<name>/…`).
+    fn set_target(&mut self, target: &str) {
+        self.target = target.to_string();
+        self.first_line = format!("{} {} {}", self.method, target, self.version);
+    }
 }
 
 fn parse_head(raw: &str) -> Option<Head> {
@@ -480,7 +746,7 @@ fn parse_head(raw: &str) -> Option<Head> {
     let mut parts = first.split_whitespace();
     let method = parts.next()?.to_string();
     let target = origin_form(parts.next()?);
-    let version = parts.next()?;
+    let version = parts.next()?.to_string();
     if !version.starts_with("HTTP/1.") {
         return None;
     }
@@ -514,6 +780,7 @@ fn parse_head(raw: &str) -> Option<Head> {
         first_line: format!("{method} {target} {version}"),
         method,
         target,
+        version,
         headers,
         upgrade,
         has_body,
@@ -556,8 +823,14 @@ fn host_allowed(head: &Head, port: u16) -> bool {
 // Index page
 // ---------------------------------------------------------------------------
 
-async fn handle_index(wr: &mut OwnedWriteHalf, remote: &Remote, refresh: bool, head_only: bool) {
-    let (status, page) = match build_page(remote, refresh).await {
+async fn handle_index(
+    wr: &mut OwnedWriteHalf,
+    remote: &Arc<Remote>,
+    ports: &AppPorts,
+    refresh: bool,
+    head_only: bool,
+) {
+    let (status, page) = match build_page(remote, ports, refresh).await {
         Ok(page) => ("200 OK", page),
         Err(err) => (
             "502 Bad Gateway",
@@ -568,7 +841,7 @@ async fn handle_index(wr: &mut OwnedWriteHalf, remote: &Remote, refresh: bool, h
         .await;
 }
 
-async fn build_page(remote: &Remote, refresh: bool) -> Result<String> {
+async fn build_page(remote: &Arc<Remote>, ports: &AppPorts, refresh: bool) -> Result<String> {
     if refresh {
         fetch_ok(remote, "POST", "/_hub/discover", "discovery refresh").await?;
     }
@@ -576,7 +849,37 @@ async fn build_page(remote: &Remote, refresh: bool) -> Result<String> {
     let body = fetch_ok(remote, "GET", "/_hub/catalog", "app catalog").await?;
     let catalog: CatalogResponse =
         serde_json::from_slice(&body).context("the server sent a malformed catalog")?;
-    Ok(render_page(&info, &catalog.apps))
+    // Anything the catalog gained (e.g. via Refresh) gets its listener now,
+    // before the links to it are rendered.
+    let app_ports = ports.ensure(remote, &catalog.apps);
+    Ok(render_page(&info, &catalog.apps, &app_ports))
+}
+
+/// `GET /app/<name>[/sub]` on the index port (an old bookmark, a stale tab,
+/// an icon URL) → the same place on the app's own port, where the app's whole
+/// origin lives. `app_port` is `None` for a name this server doesn't run —
+/// forwarding then lets the server answer authoritatively (404 JSON).
+fn redirect_location(rest: &str, query: &str, app_port: Option<u16>) -> Option<String> {
+    let app_port = app_port?;
+    let sub = rest.split_once('/').map(|(_, sub)| sub).unwrap_or("");
+    let mut location = format!("http://127.0.0.1:{app_port}/");
+    if !sub.is_empty() {
+        location.push_str(sub);
+    }
+    if !query.is_empty() {
+        location.push('?');
+        location.push_str(query);
+    }
+    Some(location)
+}
+
+async fn write_redirect(wr: &mut OwnedWriteHalf, location: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    wr.write_all(head.as_bytes()).await?;
+    let _ = wr.shutdown().await;
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -595,7 +898,10 @@ struct CatalogEntry {
     port: u16,
 }
 
-fn render_page(info: &ServerInfo, apps: &[CatalogEntry]) -> String {
+/// Render the index. `ports` maps each app to its own loopback port (apps
+/// without one — no free port left — fall back to path links on the index
+/// port, which the index redirects to the app port when it exists).
+fn render_page(info: &ServerInfo, apps: &[CatalogEntry], ports: &HashMap<String, u16>) -> String {
     let count = format!("{} app{}", apps.len(), if apps.len() == 1 { "" } else { "s" });
     let summary = match &info.version {
         Some(version) => format!("{count} · raemote {version}"),
@@ -606,7 +912,10 @@ fn render_page(info: &ServerInfo, apps: &[CatalogEntry]) -> String {
          start one and hit Refresh.</p>"
             .to_string()
     } else {
-        apps.iter().map(app_row).collect::<Vec<_>>().join("\n")
+        apps.iter()
+            .map(|app| app_row(app, ports.get(&app.name).copied()))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     fill(
         PAGE,
@@ -634,7 +943,7 @@ fn render_error(title: &str, message: &str) -> String {
     )
 }
 
-fn app_row(app: &CatalogEntry) -> String {
+fn app_row(app: &CatalogEntry, port: Option<u16>) -> String {
     let label = app
         .title
         .as_deref()
@@ -651,9 +960,12 @@ fn app_row(app: &CatalogEntry) -> String {
             format!("<span class=\"mono\">{}</span>", esc(&monogram))
         }
     };
+    let href = match port {
+        Some(port) => format!("http://127.0.0.1:{port}/"),
+        None => format!("/app/{}", esc(&app.name)),
+    };
     format!(
-        "<a class=\"app\" href=\"/app/{}\">{}<span><b>{}</b><small>:{}</small></span></a>",
-        esc(&app.name),
+        "<a class=\"app\" href=\"{href}\">{}<span><b>{}</b><small>:{}</small></span></a>",
         media,
         esc(label),
         app.port
@@ -1156,12 +1468,21 @@ mod tests {
                 port: 3000,
             },
         ];
-        let page = render_page(&info, &apps);
+        let mut ports = HashMap::new();
+        ports.insert("wiki".to_string(), 7791u16);
+        let page = render_page(&info, &apps, &ports);
         assert!(!page.contains("<script>"), "raw script must be escaped");
         assert!(page.contains("&lt;script&gt;"));
         assert!(page.contains("__APPS__ &lt;script&gt;"), "title token not re-expanded");
         assert!(page.contains("Main &amp; &lt;Page&gt;"));
-        assert!(page.contains("href=\"/app/wiki\""));
+        assert!(
+            page.contains("href=\"http://127.0.0.1:7791/\""),
+            "an app with a port links to its own origin"
+        );
+        assert!(
+            page.contains("href=\"/app/notes\""),
+            "an app without a port falls back to the path link"
+        );
         assert!(page.contains("src=\"/app/wiki/favicon.ico\""));
         assert!(page.contains("<span class=\"mono\">N</span>"), "monogram fallback");
         assert!(page.contains(":8080"));
@@ -1175,7 +1496,7 @@ mod tests {
             name: "server".to_string(),
             version: None,
         };
-        let page = render_page(&info, &[]);
+        let page = render_page(&info, &[], &HashMap::new());
         assert!(page.contains("No apps yet"));
         assert!(!page.contains("__SUMMARY__"));
     }
@@ -1196,5 +1517,119 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(load_last_from(&path), None);
         assert_eq!(load_last_from(&dir.path().join("missing.json")), None);
+    }
+
+    #[test]
+    fn app_port_mounts_the_whole_origin_under_the_app_path() {
+        // The app's origin root lives at /app/<name>/ — trailing slash, so the
+        // server strips the prefix down to the origin's "/".
+        assert_eq!(app_target("wiki", "/", ""), "/app/wiki/");
+        assert_eq!(app_target("wiki", "/", "q=1"), "/app/wiki/?q=1");
+        // Relative *and* root-absolute refs from a page arrive as plain paths
+        // on the app's port (the old /app/lib/… 404 case) and are re-mounted.
+        assert_eq!(app_target("wiki", "/lib/x.css", ""), "/app/wiki/lib/x.css");
+        assert_eq!(app_target("wiki", "/lib/x.css", "v=2"), "/app/wiki/lib/x.css?v=2");
+        assert_eq!(
+            app_target("miniwerm", "/lib/@wterm/dom/src/terminal.css", ""),
+            "/app/miniwerm/lib/@wterm/dom/src/terminal.css"
+        );
+
+        let mut head =
+            parse_head("GET /lib/x.css HTTP/1.1\r\nHost: 127.0.0.1:7791\r\nAccept: */*\r\n")
+                .unwrap();
+        head.set_target(&app_target("wiki", "/lib/x.css", ""));
+        assert_eq!(head.target, "/app/wiki/lib/x.css");
+        assert_eq!(head.first_line, "GET /app/wiki/lib/x.css HTTP/1.1");
+    }
+
+    #[test]
+    fn stale_app_links_redirect_to_the_app_port() {
+        // /app/wiki → the app's whole origin
+        assert_eq!(
+            redirect_location("wiki", "", Some(7791)),
+            Some("http://127.0.0.1:7791/".to_string())
+        );
+        // /app/wiki/favicon.ico?v=2 → same path+query on the app port
+        assert_eq!(
+            redirect_location("wiki/favicon.ico", "v=2", Some(7791)),
+            Some("http://127.0.0.1:7791/favicon.ico?v=2".to_string())
+        );
+        // A name this server doesn't run is not redirected — the server
+        // answers authoritatively when the request is forwarded as-is.
+        assert_eq!(redirect_location("lib/@wterm/x.css", "", None), None);
+    }
+
+    #[test]
+    fn state_preserves_app_ports_when_remembering_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connector.json");
+        save_last_to(&path, node(7), "Mac mini").unwrap();
+        let mut state = read_state(&path).unwrap();
+        state.ports.insert(format!("{}/wiki", node(7)), 7791);
+        write_state(&path, &state).unwrap();
+
+        save_last_to(&path, node(7), "Mac mini renamed").unwrap();
+        let state = read_state(&path).unwrap();
+        assert_eq!(state.ports.get(&format!("{}/wiki", node(7))), Some(&7791));
+        assert_eq!(state.name.as_deref(), Some("Mac mini renamed"));
+        assert_eq!(load_last_from(&path), Some(node(7)));
+    }
+
+    #[test]
+    fn app_ports_allocate_stably_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connector.json");
+        let apps = || {
+            vec![
+                CatalogEntry {
+                    name: "alpha".to_string(),
+                    title: None,
+                    icon: None,
+                    port: 1,
+                },
+                CatalogEntry {
+                    name: "beta".to_string(),
+                    title: None,
+                    icon: None,
+                    port: 2,
+                },
+            ]
+        };
+
+        let mut ports = AppPorts::new(node(9), 7788, path.clone());
+        ports.first = 23100;
+        ports.last = 23109;
+        let (map, listeners) = ports.assign_all(&apps());
+        assert_eq!(map.len(), 2, "both apps got a port");
+        let (alpha, beta) = (map["alpha"], map["beta"]);
+        assert_ne!(alpha, beta, "apps never share an origin");
+        for port in [alpha, beta] {
+            assert!((23100..=23109).contains(&port));
+        }
+        let state = read_state(&path).unwrap();
+        assert_eq!(state.ports.get(&format!("{}/alpha", node(9))), Some(&alpha));
+
+        // A fresh run reads the same file and reuses the same ports.
+        drop(listeners);
+        let mut ports2 = AppPorts::new(node(9), 7788, path.clone());
+        ports2.first = 23100;
+        ports2.last = 23109;
+        let (map2, _keep) = ports2.assign_all(&apps());
+        assert_eq!(map2["alpha"], alpha, "ports are stable across runs");
+        assert_eq!(map2["beta"], beta);
+
+        // Re-assigning on the same instance changes nothing.
+        let (again, pending) = ports.assign_all(&apps());
+        assert_eq!(again, map);
+        assert!(pending.is_empty(), "already-served apps are not re-bound");
+
+        // A *different* server with the same app names gets its own ports
+        // (the NodeId-isolation rule): its keys differ, its origins differ.
+        let mut ports3 = AppPorts::new(node(10), 7788, path);
+        ports3.first = 23100;
+        ports3.last = 23109;
+        let (map3, _keep3) = ports3.assign_all(&apps());
+        assert_ne!(map3["alpha"], alpha, "two servers stay isolated");
+        assert_ne!(map3["alpha"], beta);
     }
 }

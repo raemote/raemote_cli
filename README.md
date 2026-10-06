@@ -51,8 +51,11 @@ raemote connect '<link from raemote pair>'   # pairs this machine, opens a local
 raemote connect                              # reopens the last one
 ```
 
-It serves `http://127.0.0.1:7788` — apps listed with icons, proxied over the
-same encrypted tunnel. `--port <n>` moves it, `--no-open` skips the browser.
+It serves the app list at `http://127.0.0.1:7788` (`--port <n>` moves it,
+`--no-open` skips the browser). Each app then opens on **its own**
+`127.0.0.1` port (7790+) — its whole origin maps to the app's root, so the
+app's relative and absolute URLs, cookies and logins behave exactly as they
+do on the server.
 
 ## Commands
 

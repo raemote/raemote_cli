@@ -43,7 +43,7 @@ enum Commands {
         /// `raemote://bind?…` pairing URI, or the node id of a paired server
         /// (defaults to the last server this command used)
         target: Option<String>,
-        /// Local port for the web UI
+        /// Port for the app list (every app serves on its own port, 7790+)
         #[arg(long, default_value_t = raemote::connector::DEFAULT_PORT)]
         port: u16,
         /// Print the URL without opening a browser
