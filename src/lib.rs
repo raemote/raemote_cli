@@ -21,7 +21,9 @@
 //! into a list of web apps. [`daemon`] wires it all together, and [`ipc`] lets
 //! the CLI drive a running daemon over a Unix socket. [`config`] describes the
 //! on-disk configuration, and [`proxy`] and [`lock`] add an outbound proxy and
-//! a single-instance guard.
+//! a single-instance guard. [`connector`] is the CLI's own local web client
+//! (`raemote connect`), pairing this machine and reverse-proxying a remote
+//! server's apps to `127.0.0.1`.
 //!
 //! # Configuration
 //!
@@ -41,6 +43,7 @@ pub mod auth;
 pub mod bind;
 pub mod catalog;
 pub mod config;
+pub mod connector;
 pub mod daemon;
 pub mod discovery;
 pub mod http;

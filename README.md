@@ -44,11 +44,22 @@ Open the Raemote app, tap **+**, scan the QR code (or paste the link via
 **Manual Setup**). You only do this once. Already paired? Any paired device can
 introduce another: **server → … → Invite Device…** shows a one-time code.
 
+No phone handy? The CLI can browse the same catalog itself:
+
+```sh
+raemote connect '<link from raemote pair>'   # pairs this machine, opens a local web UI
+raemote connect                              # reopens the last one
+```
+
+It serves `http://127.0.0.1:7788` — apps listed with icons, proxied over the
+same encrypted tunnel. `--port <n>` moves it, `--no-open` skips the browser.
+
 ## Commands
 
 ```sh
 raemote status                        # running? how many apps found?
 raemote discover                      # rescan now (also runs every 30s)
+raemote connect [<uri|node-id>]       # browse this server's apps in a local web UI
 raemote apps list                     # what was found, plus manual entries
 raemote apps add <name> <port>        # pin an app discovery missed
 raemote apps hide <name|host:port>    # hide a false positive (unhide restores it)

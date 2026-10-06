@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         "bind" => {
             let arg = args.next().context(usage())?;
             let (node, token) = if arg.starts_with("raemote://") {
-                parse_bind_uri(&arg)?
+                raemote::connector::parse_bind_uri(&arg)?
             } else {
                 let token = args.next().context("bind needs a token")?;
                 (parse_node(&arg)?, token)
@@ -256,27 +256,6 @@ async fn request(
         .context("failed to read response (is this client bound?)")?;
     println!("{}", String::from_utf8_lossy(&body));
     Ok(())
-}
-
-/// `raemote://bind?node=<id>&token=<hex>&exp=<unix>`
-fn parse_bind_uri(uri: &str) -> Result<(EndpointId, String)> {
-    let query = uri
-        .strip_prefix("raemote://bind?")
-        .context("not a raemote bind URI")?;
-    let mut node = None;
-    let mut token = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').context("malformed bind URI")?;
-        match key {
-            "node" => node = Some(parse_node(value)?),
-            "token" => token = Some(value.to_string()),
-            _ => {}
-        }
-    }
-    Ok((
-        node.context("bind URI is missing the node id")?,
-        token.context("bind URI is missing the token")?,
-    ))
 }
 
 fn parse_node(s: &str) -> Result<EndpointId> {

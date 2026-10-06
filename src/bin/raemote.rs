@@ -38,6 +38,18 @@ enum Commands {
         #[arg(long, value_name = "SECS")]
         ttl: Option<u64>,
     },
+    /// Pair with a server and browse its apps in a local web UI
+    Connect {
+        /// `raemote://bind?…` pairing URI, or the node id of a paired server
+        /// (defaults to the last server this command used)
+        target: Option<String>,
+        /// Local port for the web UI
+        #[arg(long, default_value_t = raemote::connector::DEFAULT_PORT)]
+        port: u16,
+        /// Print the URL without opening a browser
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Manage paired devices
     #[command(alias = "authorized")]
     Devices {
@@ -178,6 +190,9 @@ async fn main() -> Result<()> {
         Commands::Status { json } => cmd_status(json).await,
         Commands::Reload => cmd_reload().await,
         Commands::Pair { no_refresh, json, ttl } => cmd_pair(no_refresh, json, ttl).await,
+        Commands::Connect { target, port, no_open } => {
+            raemote::connector::run(target.as_deref(), port, !no_open).await
+        }
         Commands::Devices { command } => match command {
             DevicesCommands::List { json } => cmd_devices_list(json).await,
             DevicesCommands::Rename { node_id, name } => cmd_devices_rename(&node_id, &name).await,
