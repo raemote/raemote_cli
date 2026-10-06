@@ -15,7 +15,7 @@ Requires Raemote **0.2.0+** (for `pair`/`doctor`); on 0.1.0 use `qr`/`status`.
 ### 1. Install
 
 ```sh
-curl -fsSL https://github.com/raemote/raemote_server/raw/main/install.sh | sh -s -- --json
+curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh | sh -s -- --json
 ```
 
 stdout is one JSON object:
@@ -61,4 +61,4 @@ the code or paste the link.
   then `"<bin_dir>/raemote" restart`.
 - Do not run the daemon as root.
 
-Full reference: <https://github.com/raemote/raemote_server>
+Full reference: <https://github.com/raemote/raemote_cli>

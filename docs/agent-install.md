@@ -18,7 +18,7 @@ Every step is non-interactive and machine-verifiable.
 ## Step 1 — install
 
 ```sh
-curl -fsSL https://github.com/raemote/raemote_server/raw/main/install.sh \
+curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh \
   | sh -s -- --json
 ```
 
@@ -83,7 +83,7 @@ proxy and restart:
 ## Reversing it
 
 ```sh
-curl -fsSL https://github.com/raemote/raemote_server/raw/main/install.sh \
+curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh \
   | sh -s -- --uninstall          # add --purge to also delete ~/.raemote
 ```
 

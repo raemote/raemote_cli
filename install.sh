@@ -1,7 +1,7 @@
 #!/bin/sh
 # raemote server installer
 #
-#   curl -fsSL https://github.com/raemote/raemote_server/raw/main/install.sh | sh
+#   curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh | sh
 #
 # Downloads the latest release (Gitee, falling back to GitHub), verifies its
 # SHA-256, installs `raemote` + `raemoted` into ~/.local/bin, installs and
@@ -14,8 +14,8 @@ set -eu
 # ---------------------------------------------------------------------------
 # Defaults (all overridable via env or flags)
 # ---------------------------------------------------------------------------
-GITEE_REPO="${RAEMOTE_GITEE_REPO:-pppkin/raemote_server}"
-GITHUB_REPO="${RAEMOTE_GITHUB_REPO:-raemote/raemote_server}"
+GITEE_REPO="${RAEMOTE_GITEE_REPO:-pppkin/raemote_cli}"
+GITHUB_REPO="${RAEMOTE_GITHUB_REPO:-raemote/raemote_cli}"
 SOURCE="${RAEMOTE_SOURCE:-auto}"          # auto | gitee | github
 BIN_DIR="${RAEMOTE_BIN_DIR:-$HOME/.local/bin}"
 TAG="${RAEMOTE_TAG:-}"

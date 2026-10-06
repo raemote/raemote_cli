@@ -428,7 +428,7 @@ pub fn validate(config: &Config) -> Result<()> {
 /// A commented default configuration file, used by `raemote config init`.
 pub fn default_toml() -> &'static str {
     r#"# raemote server configuration
-# See https://github.com/raemote/raemote_server for documentation.
+# See https://github.com/raemote/raemote_cli for documentation.
 
 # Name this server shows to your paired phones (defaults to the hostname).
 # name = "my-server"

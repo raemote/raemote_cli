@@ -21,7 +21,7 @@ root. Asset names omit the version so `releases/latest/download/<asset>` works.
 
 ## Steps
 
-1. Bump the version in `raemote_server/Cargo.toml` and commit it.
+1. Bump the version in `raemote_cli/Cargo.toml` and commit it.
 2. Tag and push:
 
    ```sh
@@ -72,13 +72,13 @@ root. Asset names omit the version so `releases/latest/download/<asset>` works.
 6. Verify the one-liner on a clean machine (fresh `HOME` is enough):
 
    ```sh
-   curl -fsSL https://github.com/raemote/raemote_server/raw/main/install.sh | sh
+   curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh | sh
    raemote status
    ```
 
    (If only GitHub has the release, the installer falls back to it
    automatically. Test both entry points when it matters:
-   `https://gitee.com/pppkin/raemote_server/raw/main/install.sh`.)
+   `https://gitee.com/pppkin/raemote_cli/raw/main/install.sh`.)
 
 ## Manual fallback
 
@@ -96,9 +96,9 @@ those files as release assets (Gitee or GitHub).
 
 `install.sh` resolves the latest release in this order:
 
-1. Gitee (`pppkin/raemote_server`), using the Gitee releases API — needs a Gitee
+1. Gitee (`pppkin/raemote_cli`), using the Gitee releases API — needs a Gitee
    release with the assets.
-2. GitHub (`raemote/raemote_server`), using
+2. GitHub (`raemote/raemote_cli`), using
    `releases/latest/download/<asset>` — needs a GitHub release.
 
 Override with `--source gitee|github`, `--tag <tag>`, or `--base-url <url>`.

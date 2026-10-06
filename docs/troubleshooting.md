@@ -119,5 +119,5 @@ not reachable through Raemote yet; add it manually only if it also serves HTTP.
 ## Getting help
 
 Gather `raemote doctor --json` and a few lines from `raemote logs`, then open an
-issue: <https://github.com/raemote/raemote_server/issues>. For security problems,
+issue: <https://github.com/raemote/raemote_cli/issues>. For security problems,
 follow [`SECURITY.md`](../SECURITY.md) instead of opening a public issue.

@@ -6,7 +6,7 @@ real release.
 
 ## Automated
 
-Server (from `raemote_server/`):
+Server (from `raemote_cli/`):
 
 ```sh
 cargo test                    # unit tests + doctests

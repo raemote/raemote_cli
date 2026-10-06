@@ -10,7 +10,7 @@
 #
 # Env:
 #   GITEE_TOKEN        required. Gitee personal access token with `projects`.
-#   GITEE_REPO         default: pppkin/raemote_server
+#   GITEE_REPO         default: pppkin/raemote_cli
 #   RELEASE_NAME       default: the tag
 #   RELEASE_BODY_FILE  optional markdown body for the Gitee release
 #   PRERELEASE         default: false
@@ -21,7 +21,7 @@ tag=${1:?usage: sync-gitee.sh <tag> <assets-dir>}
 assets_dir=${2:?usage: sync-gitee.sh <tag> <assets-dir>}
 : "${GITEE_TOKEN:?GITEE_TOKEN is required (a Gitee token with the 'projects' scope)}"
 
-repo=${GITEE_REPO:-pppkin/raemote_server}
+repo=${GITEE_REPO:-pppkin/raemote_cli}
 api=${GITEE_API:-https://gitee.com/api/v5}/repos/$repo
 name=${RELEASE_NAME:-$tag}
 prerelease=${PRERELEASE:-false}

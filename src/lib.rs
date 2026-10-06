@@ -32,7 +32,7 @@
 //!
 //! # Getting started
 //!
-//! The [README](https://github.com/raemote/raemote_server#readme) covers
+//! The [README](https://github.com/raemote/raemote_cli#readme) covers
 //! installation, pairing, and everyday use.
 //!
 //! [iroh]: https://iroh.computer
