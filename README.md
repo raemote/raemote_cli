@@ -4,14 +4,15 @@
 
 # Raemote
 
-Use the web apps running on your computer — from your phone, anywhere.
+Use the web apps running on your computer — from your phone, laptop, anywhere.
 
-Raemote is a small server you run on your own machine. It finds the web apps
+`raemoted` is a small server daemon you run on your own machine. It finds the web apps
 already running there (Jellyfin, Home Assistant, a dev server — anything on
-`http://localhost`) and makes them reachable from the Raemote iOS app. No
+`http://localhost`) and makes them reachable from the `Raemote iOS app` or `raemote` cli tool. No
 account, no VPN, no port forwarding: the connection is end-to-end encrypted and
-goes direct when it can, otherwise through a public relay that forwards it
-without being able to read it.
+goes direct when it can, otherwise through a public relay.
+
+Think of this as an encrypted, p2p connected and super easy to setup reverse proxy.
 
 <a href="https://testflight.apple.com/join/3AQeWyUR"><img src="https://github.com/raemote/raemote_cli/raw/main/testflight_badge.svg" alt="Available on TestFlight" height="64"></a>
 
@@ -30,7 +31,7 @@ installer then prefers the Gitee release):
 curl -fsSL https://gitee.com/pppkin/raemote_cli/raw/main/install.sh | sh
 ```
 
-It installs `raemote` into `~/.local/bin` and starts a background service.
+It installs `raemote` and `raemoted` into `~/.local/bin` and starts a background service.
 Prefer to read it first? Download `install.sh`, then `sh install.sh`. Flags
 include `--no-service`, `--bin-dir <dir>` and `--proxy <url>`.
 
@@ -44,7 +45,7 @@ Open the Raemote app, tap **+**, scan the QR code (or paste the link via
 **Manual Setup**). You only do this once. Already paired? Any paired device can
 introduce another: **server → … → Invite Device…** shows a one-time code.
 
-No phone handy? The CLI can browse the same catalog itself:
+The CLI can browse the same catalog itself, on a different machine:
 
 ```sh
 raemote connect '<link from raemote pair>'   # pairs this machine, opens a local web UI
@@ -53,9 +54,7 @@ raemote connect                              # reopens the last one
 
 It serves the app list at `http://127.0.0.1:7788` (`--port <n>` moves it,
 `--no-open` skips the browser). Each app then opens on **its own**
-`127.0.0.1` port (7790+) — its whole origin maps to the app's root, so the
-app's relative and absolute URLs, cookies and logins behave exactly as they
-do on the server.
+`127.0.0.1` port (7790+).
 
 ## Commands
 
