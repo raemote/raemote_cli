@@ -1,7 +1,7 @@
 # Installing Raemote from an AI agent
 
-> Requires a Raemote release that includes `pair` and `doctor` (**0.2.0+**).
-> On 0.1.0, use `raemote qr` and `raemote status` instead.
+> Requires Raemote **0.2.0+** (for `pair` and `doctor`). On 0.1.x, use
+> `raemote qr` and `raemote status` instead.
 
 Raemote is designed to be installed by an AI agent acting on the user's machine.
 Every step is non-interactive and machine-verifiable.
@@ -25,7 +25,7 @@ curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh \
 stdout:
 
 ```json
-{"installed":true,"version":"0.1.0","bin_dir":"/home/you/.local/bin","service":true,"node_id":"<hex>","uri":"raemote://bind?node=<hex>&token=<hex>&exp=<unix>"}
+{"installed":true,"version":"0.2.0","bin_dir":"/home/you/.local/bin","service":true,"node_id":"<hex>","uri":"raemote://bind?node=<hex>&token=<hex>&exp=<unix>"}
 ```
 
 - `"service":false` → the background service was not installed; run

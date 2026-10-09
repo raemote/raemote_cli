@@ -8,7 +8,7 @@ description: Set up the Raemote server on this machine so the user can reach loc
 Raemote is a self-hosted server that lets a phone reach web apps running on this
 machine. Installation is non-interactive and machine-verifiable.
 
-Requires Raemote **0.2.0+** (for `pair`/`doctor`); on 0.1.0 use `qr`/`status`.
+Requires Raemote **0.2.0+** (for `pair`/`doctor`); on 0.1.x use `qr`/`status`.
 
 ## Steps
 
@@ -21,7 +21,7 @@ curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh | sh -s --
 stdout is one JSON object:
 
 ```json
-{"installed":true,"version":"0.1.0","bin_dir":"/home/you/.local/bin","service":true,"node_id":"<hex>","uri":"raemote://bind?..."}
+{"installed":true,"version":"0.2.0","bin_dir":"/home/you/.local/bin","service":true,"node_id":"<hex>","uri":"raemote://bind?..."}
 ```
 
 - If `"service": false`, install it: `"<bin_dir>/raemote" service install`.
