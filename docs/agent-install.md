@@ -25,7 +25,7 @@ curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh \
 stdout:
 
 ```json
-{"installed":true,"version":"0.2.0","bin_dir":"/home/you/.local/bin","service":true,"node_id":"<hex>","uri":"raemote://bind?node=<hex>&token=<hex>&exp=<unix>"}
+{"installed":true,"version":"0.3.0","bin_dir":"/home/you/.local/bin","service":true,"node_id":"<hex>","uri":"raemote://bind?node=<hex>&token=<hex>&exp=<unix>"}
 ```
 
 - `"service":false` → the background service was not installed; run
