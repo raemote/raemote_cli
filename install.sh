@@ -41,6 +41,19 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Platform-specific recovery hints for a daemon that failed to come up.
+service_hint() {
+    if have launchctl; then
+        printf '  macOS: the LaunchAgent needs an active GUI session at the console.\n'
+        printf '         Check: launchctl print gui/%s/com.raemote.raemoted\n' "$(id -u)"
+    elif have systemctl; then
+        printf '  Linux: check: systemctl --user status raemoted\n'
+        printf '         journalctl --user -u raemoted -n 50 --no-pager\n'
+        printf '         If the user manager is unavailable: loginctl enable-linger %s\n' "$(id -un)"
+    fi
+    printf '  Logs:  %s/raemote logs -n 100\n' "$BIN_DIR"
+}
+
 usage() {
     cat >&2 <<'EOF'
 raemote installer
@@ -355,7 +368,9 @@ if [ "$DO_SERVICE" = 1 ]; then
     if "$BIN_DIR/raemote" service install; then
         service_installed=true
     else
-        warn "service install failed; run '$BIN_DIR/raemote service install' manually"
+        die "service install failed — the binaries are in $BIN_DIR, but the daemon is not installed.
+$(service_hint)
+  Then retry: $BIN_DIR/raemote service install"
     fi
     # Linux: keep the user service alive after logout.
     if have loginctl; then
@@ -372,7 +387,7 @@ node_id=""
 if [ "$DO_SERVICE" = 1 ]; then
     log "waiting for the daemon ..."
     i=0
-    while [ "$i" -lt 20 ]; do
+    while [ "$i" -lt 60 ]; do
         if "$BIN_DIR/raemote" status --json >/dev/null 2>&1; then break; fi
         i=$((i + 1))
         sleep 0.5
@@ -384,13 +399,21 @@ if [ "$DO_SERVICE" = 1 ]; then
         qr_json=$("$BIN_DIR/raemote" qr --json 2>/dev/null || true)
         uri=$(printf '%s' "$qr_json" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p')
     else
-        warn "the daemon is not answering yet; check: '$BIN_DIR/raemote status'"
+        # The service is installed but nothing is answering: leave the machine
+        # in a known state (installed but down) rather than exiting 0 and
+        # pretending the upgrade succeeded.
+        die "the daemon did not come up within 30s — the binaries in $BIN_DIR are installed, but raemoted is not answering.
+$(service_hint)
+  Then retry: $BIN_DIR/raemote start"
     fi
 fi
 
+running=false
+if "$BIN_DIR/raemote" status --json >/dev/null 2>&1; then running=true; fi
+
 if [ "$JSON" = 1 ]; then
-    printf '{"installed":true,"version":"%s","bin_dir":"%s","service":%s,"node_id":"%s","uri":"%s"}\n' \
-        "${VERSION:-unknown}" "$BIN_DIR" "$service_installed" "$node_id" "$uri"
+    printf '{"installed":true,"version":"%s","bin_dir":"%s","service":%s,"running":%s,"node_id":"%s","uri":"%s"}\n' \
+        "${VERSION:-unknown}" "$BIN_DIR" "$service_installed" "$running" "$node_id" "$uri"
 else
     log ""
     log "raemote ${VERSION:-?} installed into $BIN_DIR"

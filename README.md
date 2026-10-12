@@ -34,6 +34,9 @@ curl -fsSL https://gitee.com/pppkin/raemote_cli/raw/main/install.sh | sh
 It installs `raemote` and `raemoted` into `~/.local/bin` and starts a background service.
 Prefer to read it first? Download `install.sh`, then `sh install.sh`. Flags
 include `--no-service`, `--bin-dir <dir>` and `--proxy <url>`.
+Re-running it upgrades in place: the daemon restarts (live connections drop
+briefly) with the same identity and paired devices, and the installer exits
+non-zero — with recovery hints — if the service fails to come up.
 
 ## Pair
 

@@ -25,11 +25,15 @@ curl -fsSL https://github.com/raemote/raemote_cli/raw/main/install.sh \
 stdout:
 
 ```json
-{"installed":true,"version":"0.3.0","bin_dir":"/home/you/.local/bin","service":true,"node_id":"<hex>","uri":"raemote://bind?node=<hex>&token=<hex>&exp=<unix>"}
+{"installed":true,"version":"0.3.0","bin_dir":"/home/you/.local/bin","service":true,"running":true,"node_id":"<hex>","uri":"raemote://bind?node=<hex>&token=<hex>&exp=<unix>"}
 ```
 
 - `"service":false` → the background service was not installed; run
   `"<bin_dir>/raemote" service install`.
+- `"running":true` → the daemon answered `status` before the installer exited.
+  If the service fails to come up, the installer **exits non-zero** with
+  platform-specific recovery hints on stderr — a dead daemon can never look
+  like a successful install.
 - `bin_dir` may not be on `PATH`; call the binary by absolute path.
 - With `--no-service` the installer skips the service (and omits `uri`); start
   the daemon with `"<bin_dir>/raemote" start`.

@@ -91,7 +91,12 @@ pub fn install() -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // "Already loaded" is not an error
         if !stderr.contains("Already loaded") {
-            eprintln!("launchctl bootstrap: {stderr}");
+            anyhow::bail!(
+                "launchctl bootstrap gui/{} failed: {stderr}\n\
+                 the LaunchAgent needs an active GUI session at the console — log in once \
+                 (e.g. via Screen Sharing), then run 'raemote service install' again",
+                uid()
+            );
         }
     }
 

@@ -56,14 +56,16 @@ pub fn install() -> Result<()> {
     std::fs::write(&path, &content)
         .with_context(|| format!("failed to write {}", path.display()))?;
 
-    // Reload and enable
+    // Reload and enable. Both must succeed: a half-installed user unit that
+    // systemd never started is exactly the silent-dead-daemon state an update
+    // must not be able to leave behind.
     let output = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .output()
         .context("failed to run systemctl daemon-reload")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("systemctl daemon-reload: {stderr}");
+        anyhow::bail!("systemctl --user daemon-reload failed: {stderr}");
     }
 
     let output = std::process::Command::new("systemctl")
@@ -72,7 +74,11 @@ pub fn install() -> Result<()> {
         .context("failed to run systemctl enable")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("systemctl enable: {stderr}");
+        anyhow::bail!(
+            "systemctl --user enable --now {UNIT_NAME} failed: {stderr}\n\
+             a user manager is required — check 'loginctl enable-linger $USER', \
+             then run 'raemote service install' again"
+        );
     }
 
     println!("service installed: {}", path.display());
