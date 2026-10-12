@@ -67,6 +67,19 @@ Legend: **ID** · Steps → *Expected*.
 | C3 | Restart the daemon (`raemote restart`) and retry the revoked device. | Still refused. |
 | C4 | Re-pair the same device with a fresh `raemote pair`. | Access is restored. |
 
+### C2. Per-device access scopes
+
+| ID | Steps | Expected |
+| --- | --- | --- |
+| P1 | `raemote pair --ports 3000` → pair a device with that link. | The device sees only the app on port 3000; the app list omits every other app. |
+| P2 | On the restricted device, open an app whose port is not in its allowlist (e.g. paste its URL, or a stale bookmark). | Refused with a clear "not shared with this device" reason (HTTP 403). |
+| P3 | The restricted device asks to invite another device (app → … → Invite Device…). | The new device is restricted the same way — it never gets more than the inviter had. |
+| P4 | `raemote devices access <node-id> --ports 3000,8080`. | The device immediately sees both apps. |
+| P5 | `raemote devices access <node-id> --all`. | The device sees every app again. |
+| P6 | `raemote devices list`. | Each device shows its access (`all apps`, or the port list). |
+| P7 | `raemote config set bind.allow_ports 3000`, then `raemote pair`. | The new link is restricted to port 3000 by default. |
+| P8 | Pair a restricted device, then `raemote restart`. | The device keeps its restriction (the allowlist is persisted). |
+
 ### D. Persistence and recovery
 
 | ID | Steps | Expected |

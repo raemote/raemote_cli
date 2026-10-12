@@ -2,7 +2,7 @@
 
 use iroh::Endpoint;
 
-use crate::auth::TokenInfo;
+use crate::auth::{scope_json, TokenInfo};
 
 /// Print the binding block to stdout. The token is a secret until it expires:
 /// it goes to stdout for the operator to copy/scan, never to tracing.
@@ -17,6 +17,7 @@ pub fn print_binding(endpoint: &Endpoint, token: &TokenInfo) {
         token.expires_at_unix,
         token.ttl.as_secs()
     );
+    println!("  access  : {}", scope_json(&token.scope));
     println!("  uri     : {uri}");
     println!("=================================================");
 

@@ -4,7 +4,7 @@
 //! attempts in constant time, locks out brute force, and persists authorized
 //! device identities to disk.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use iroh::EndpointId;
+use serde::{Deserialize, Serialize};
 
 use crate::identity;
 
@@ -65,6 +66,9 @@ pub struct TokenInfo {
     pub expires_at_unix: u64,
     /// The token lifetime.
     pub ttl: Duration,
+    /// What a device pairing with this token may reach. Never embedded in the
+    /// URI — it lives server-side.
+    pub scope: Scope,
 }
 
 impl TokenInfo {
@@ -74,6 +78,71 @@ impl TokenInfo {
             "raemote://bind?node={node}&token={}&exp={}",
             self.token_hex, self.expires_at_unix
         )
+    }
+}
+
+/// What a paired device may reach: every app, or only apps on specific ports.
+///
+/// A device's scope is fixed by the credential it binds with (the pairing token
+/// or invitation carries one) and can be changed by the owner via
+/// `raemote devices access`. It is persisted per-device in
+/// `~/.raemote/device_scopes`; a device absent from that file has [`Scope::All`]
+/// (every device paired before scopes existed keeps full access).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// Every app in the catalog.
+    All,
+    /// Only apps whose origin port is in this set.
+    Ports(BTreeSet<u16>),
+}
+
+impl Scope {
+    /// Whether an app on `port` is reachable under this scope.
+    pub fn allows_port(&self, port: u16) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Ports(ports) => ports.contains(&port),
+        }
+    }
+
+    /// Whether every port allowed by `self` is also allowed by `other`.
+    ///
+    /// Used to clamp invitations: an inviter may only narrow its own grant,
+    /// never widen it.
+    pub fn is_subset_of(&self, other: &Scope) -> bool {
+        match (self, other) {
+            (_, Scope::All) => true,
+            (Scope::All, Scope::Ports(_)) => false,
+            (Scope::Ports(a), Scope::Ports(b)) => a.is_subset(b),
+        }
+    }
+
+    /// The restricted port set, or `None` for [`Scope::All`].
+    pub fn ports(&self) -> Option<&BTreeSet<u16>> {
+        match self {
+            Scope::All => None,
+            Scope::Ports(ports) => Some(ports),
+        }
+    }
+}
+
+/// Build a [`Scope`] from a comma-separated port list.
+///
+/// `None` means [`Scope::All`]. An empty list is a valid (if drastic) scope:
+/// the device pairs but sees no apps.
+pub fn scope_from_ports(ports: Option<Vec<u16>>) -> Scope {
+    match ports {
+        None => Scope::All,
+        Some(ports) => Scope::Ports(ports.into_iter().collect()),
+    }
+}
+
+/// A compact JSON form of a scope, for `/_hub/info` and IPC.
+pub fn scope_json(scope: &Scope) -> serde_json::Value {
+    match scope {
+        Scope::All => serde_json::json!({ "all": true }),
+        Scope::Ports(ports) => serde_json::json!({ "all": false, "ports": ports }),
     }
 }
 
@@ -144,6 +213,7 @@ pub struct AuthState {
     inner: Mutex<Inner>,
     store_path: std::path::PathBuf,
     names_path: std::path::PathBuf,
+    scopes_path: std::path::PathBuf,
     max_attempts: AtomicU32,
 }
 
@@ -162,6 +232,10 @@ struct Inner {
     /// to resurrect (startup mints fresh), which matches the design where a
     /// restart invalidates in-memory pairing state.
     revoked: HashMap<EndpointId, u64>,
+    /// Per-device access scopes. A device absent from this map has
+    /// [`Scope::All`]. Persisted to `device_scopes` alongside the authorized
+    /// set, so a restart keeps every device's restriction.
+    scopes: HashMap<EndpointId, Scope>,
     /// Next token generation counter, bumped on every mint.
     next_generation: u64,
 }
@@ -185,6 +259,8 @@ struct PendingToken {
     /// node with the generation that was live at revocation time; presenting a
     /// token whose generation is at or below that mark is denied.
     generation: u64,
+    /// What a device pairing with this token may reach.
+    scope: Scope,
 }
 
 /// A one-time invitation: whoever redeems it first becomes an authorized
@@ -194,6 +270,10 @@ struct Invitation {
     expires_at: Instant,
     /// The already-authorized device that asked for this invitation.
     created_by: EndpointId,
+    /// What the redeeming device may reach: a subset of the inviter's scope,
+    /// fixed at mint time. The redeemer never supplies a scope, so there is
+    /// nothing to forge at redemption.
+    scope: Scope,
 }
 
 impl AuthState {
@@ -205,7 +285,8 @@ impl AuthState {
         let dir = identity::ensure_data_dir()?;
         let store_path = dir.join("authorized_nodes");
         let names_path = dir.join("device_names");
-        Self::load_at(store_path, names_path, max_attempts)
+        let scopes_path = dir.join("device_scopes");
+        Self::load_at(store_path, names_path, scopes_path, max_attempts)
     }
 
     /// Load from explicit store paths. Used by tests and by callers that own
@@ -213,12 +294,14 @@ impl AuthState {
     pub fn load_at(
         store_path: std::path::PathBuf,
         names_path: std::path::PathBuf,
+        scopes_path: std::path::PathBuf,
         max_attempts: u32,
     ) -> Result<Self> {
         let authenticated = load_authorized(&store_path);
         let mut names = load_names(&names_path);
         // Drop names for devices that are no longer authorized.
         names.retain(|id, _| authenticated.contains(id));
+        let scopes = load_scopes(&scopes_path);
         tracing::info!(
             "loaded {} authorized node(s) from {}",
             authenticated.len(),
@@ -232,10 +315,12 @@ impl AuthState {
                 invitations: HashMap::new(),
                 failed_attempts: 0,
                 revoked: HashMap::new(),
+                scopes,
                 next_generation: 0,
             }),
             store_path,
             names_path,
+            scopes_path,
             max_attempts: AtomicU32::new(max_attempts),
         })
     }
@@ -255,6 +340,7 @@ impl AuthState {
                     token_hex: p.token_hex.clone(),
                     expires_at_unix: p.expires_at_unix,
                     ttl,
+                    scope: p.scope.clone(),
                 })
             } else {
                 None
@@ -290,12 +376,16 @@ impl AuthState {
     /// can never let a revoked device keep access; the warning signals that the
     /// change may not survive a restart.
     pub fn revoke(&self, node: EndpointId) -> bool {
-        let (entries, names): (Vec<String>, HashMap<String, String>) = {
+        let (entries, names, scopes): (Vec<String>, HashMap<String, String>, HashMap<String, Scope>) = {
             let mut inner = self.inner.lock().expect("auth state poisoned");
             if !inner.authenticated.remove(&node) {
                 return false;
             }
             inner.names.remove(&node);
+            // The scope belongs to the identity, not the device record: drop it
+            // with the device so a restart cannot resurrect a restriction (or,
+            // worse, leave a stale grant behind for a re-paired device).
+            inner.scopes.remove(&node);
             // Revocation must not be reversible by the revoked party: mark the
             // node with the current token generation, so the still-live
             // multi-use token no longer re-binds it. A token minted *after*
@@ -312,6 +402,11 @@ impl AuthState {
                     .iter()
                     .map(|(id, n)| (id.to_string(), n.clone()))
                     .collect(),
+                inner
+                    .scopes
+                    .iter()
+                    .map(|(id, s)| (id.to_string(), s.clone()))
+                    .collect(),
             )
         };
         match save_authorized(&self.store_path, &entries) {
@@ -322,6 +417,9 @@ impl AuthState {
         }
         if let Err(err) = save_names(&self.names_path, &names) {
             tracing::warn!("failed to persist device names after revoke: {err:#}");
+        }
+        if let Err(err) = save_scopes(&self.scopes_path, &scopes) {
+            tracing::warn!("failed to persist device scopes after revoke: {err:#}");
         }
         true
     }
@@ -378,7 +476,7 @@ impl AuthState {
 
     /// Mint a fresh token, replacing (invalidating) any previous one.
     pub fn mint_token(&self, ttl: Duration) -> TokenInfo {
-        self.mint_token_with(ttl, None)
+        self.mint_token_with(ttl, None, Scope::All)
     }
 
     /// Longest token lifetime we accept (~100 years).
@@ -391,8 +489,9 @@ impl AuthState {
     ///
     /// A fixed token keeps the pairing link stable across daemon restarts, which
     /// is useful when a link must remain valid for a long time. `ttl` is clamped
-    /// to [`Self::MAX_TTL`].
-    pub fn mint_token_with(&self, ttl: Duration, fixed: Option<&str>) -> TokenInfo {
+    /// to [`Self::MAX_TTL`]. `scope` is what devices pairing with this token may
+    /// reach; it lives server-side and is never embedded in the link.
+    pub fn mint_token_with(&self, ttl: Duration, fixed: Option<&str>, scope: Scope) -> TokenInfo {
         let ttl = ttl.min(Self::MAX_TTL);
         let token_hex = match fixed {
             Some(value) => value.to_string(),
@@ -405,6 +504,7 @@ impl AuthState {
             token_hex,
             expires_at_unix: unix_now().saturating_add(ttl.as_secs()),
             ttl,
+            scope: scope.clone(),
         };
         let mut inner = self.inner.lock().expect("auth state poisoned");
         inner.next_generation += 1;
@@ -413,6 +513,7 @@ impl AuthState {
             expires_at: Instant::now() + ttl,
             expires_at_unix: info.expires_at_unix,
             generation: inner.next_generation,
+            scope,
         });
         inner.failed_attempts = 0;
         info
@@ -421,11 +522,17 @@ impl AuthState {
     /// Mint a one-time invitation: the first device to redeem it becomes
     /// authorized, and the invitation is consumed. Bounded by `max_pending` so
     /// a device can't pile up capabilities.
+    ///
+    /// `scope` is what the redeeming device may reach. The caller must already
+    /// have clamped it to the inviter's own scope (see
+    /// [`Scope::is_subset_of`]); this method stores it verbatim, so the
+    /// invitation can never widen the inviter's grant.
     pub fn mint_invitation(
         &self,
         ttl: Duration,
         created_by: EndpointId,
         max_pending: usize,
+        scope: Scope,
     ) -> Result<TokenInfo> {
         let ttl = ttl.min(Self::MAX_TTL);
         let mut inner = self.inner.lock().expect("auth state poisoned");
@@ -443,12 +550,14 @@ impl AuthState {
             token_hex: token_hex.clone(),
             expires_at_unix: unix_now().saturating_add(ttl.as_secs()),
             ttl,
+            scope: scope.clone(),
         };
         inner.invitations.insert(
             token_hex,
             Invitation {
                 expires_at: now + ttl,
                 created_by,
+                scope,
             },
         );
         tracing::info!(inviter = %created_by.fmt_short(), "minted a one-time invitation");
@@ -488,10 +597,14 @@ impl AuthState {
             {
                 return BindOutcome::NoActiveToken;
             }
-            let entries = Self::authorize(&mut inner, node);
+            let scope = pending.scope.clone();
+            let (entries, scopes) = Self::authorize(&mut inner, node, scope);
             drop(inner);
             if let Err(err) = save_authorized(&self.store_path, &entries) {
                 tracing::warn!("failed to persist authorized nodes: {err:#}");
+            }
+            if let Err(err) = save_scopes(&self.scopes_path, &scopes) {
+                tracing::warn!("failed to persist device scopes: {err:#}");
             }
             return BindOutcome::Bound;
         }
@@ -501,12 +614,12 @@ impl AuthState {
         let mut matched = None;
         for (token_hex, invitation) in &inner.invitations {
             if constant_time_eq(presented.as_bytes(), token_hex.as_bytes()) {
-                matched = Some((token_hex.clone(), invitation.created_by));
+                matched = Some((token_hex.clone(), invitation.created_by, invitation.scope.clone()));
             }
         }
-        if let Some((token_hex, created_by)) = matched {
+        if let Some((token_hex, created_by, scope)) = matched {
             inner.invitations.remove(&token_hex);
-            let entries = Self::authorize(&mut inner, node);
+            let (entries, scopes) = Self::authorize(&mut inner, node, scope);
             tracing::info!(
                 node = %node.fmt_short(),
                 inviter = %created_by.fmt_short(),
@@ -515,6 +628,9 @@ impl AuthState {
             drop(inner);
             if let Err(err) = save_authorized(&self.store_path, &entries) {
                 tracing::warn!("failed to persist authorized nodes: {err:#}");
+            }
+            if let Err(err) = save_scopes(&self.scopes_path, &scopes) {
+                tracing::warn!("failed to persist device scopes: {err:#}");
             }
             return BindOutcome::BoundViaInvitation;
         }
@@ -539,14 +655,25 @@ impl AuthState {
     }
 
     /// Insert `node` into the authorized set (the caller holds the lock), reset
-    /// the failure counter, and return the entries to persist.
-    fn authorize(inner: &mut Inner, node: EndpointId) -> Vec<String> {
+    /// the failure counter, record its scope, and return the entries to persist.
+    fn authorize(
+        inner: &mut Inner,
+        node: EndpointId,
+        scope: Scope,
+    ) -> (Vec<String>, HashMap<String, Scope>) {
         inner.authenticated.insert(node);
         // The node is authorized again; the revocation marker is moot (and
         // would otherwise grow without bound).
         inner.revoked.remove(&node);
         inner.failed_attempts = 0;
-        inner.authenticated.iter().map(|id| id.to_string()).collect()
+        inner.scopes.insert(node, scope);
+        let entries = inner.authenticated.iter().map(|id| id.to_string()).collect();
+        let scopes = inner
+            .scopes
+            .iter()
+            .map(|(id, s)| (id.to_string(), s.clone()))
+            .collect();
+        (entries, scopes)
     }
 
     /// Whether a connection from `node` may use the serve ALPN.
@@ -556,6 +683,44 @@ impl AuthState {
             .expect("auth state poisoned")
             .authenticated
             .contains(&node)
+    }
+
+    /// The scope a device was granted. Defaults to [`Scope::All`] for devices
+    /// paired before scopes existed (or whose scope line was lost).
+    pub fn scope_for(&self, node: EndpointId) -> Scope {
+        self.inner
+            .lock()
+            .expect("auth state poisoned")
+            .scopes
+            .get(&node)
+            .cloned()
+            .unwrap_or(Scope::All)
+    }
+
+    /// Whether `node` may reach an app on `port` right now.
+    pub fn can_access_port(&self, node: EndpointId, port: u16) -> bool {
+        self.scope_for(node).allows_port(port)
+    }
+
+    /// Change a device's scope (owner-only, via IPC).
+    ///
+    /// The device must already be authorized. The change is immediate and
+    /// persisted, so it survives a restart. A device can never change its own
+    /// scope — this is reachable only from the owner's CLI.
+    pub fn set_scope(&self, node: EndpointId, scope: Scope) -> Result<()> {
+        let scopes: HashMap<String, Scope> = {
+            let mut inner = self.inner.lock().expect("auth state poisoned");
+            if !inner.authenticated.contains(&node) {
+                anyhow::bail!("device {} is not authorized", node.fmt_short());
+            }
+            inner.scopes.insert(node, scope);
+            inner
+                .scopes
+                .iter()
+                .map(|(id, s)| (id.to_string(), s.clone()))
+                .collect()
+        };
+        save_scopes(&self.scopes_path, &scopes)
     }
 }
 
@@ -585,6 +750,84 @@ fn load_authorized(path: &Path) -> HashSet<EndpointId> {
 fn save_authorized(path: &Path, entries: &[String]) -> Result<()> {
     let mut content = entries.join("\n");
     content.push('\n');
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    identity::restrict(&tmp, 0o600);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Load the per-device scope map from `device_scopes`.
+///
+/// Format: one line per device, `<node-hex> <scope>` where scope is `all` or a
+/// comma-separated port list. A missing file yields an empty map (every device
+/// has [`Scope::All`]). A malformed line for a live node is **fail-closed**:
+/// the node gets an empty port set (deny all apps) plus a loud warning, rather
+/// than being treated as unrestricted.
+fn load_scopes(path: &Path) -> HashMap<EndpointId, Scope> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((id_part, scope_part)) = line.split_once(char::is_whitespace) else {
+            tracing::warn!("ignoring malformed scope line in {}: {line}", path.display());
+            continue;
+        };
+        let Ok(id) = EndpointId::from_str(id_part) else {
+            tracing::warn!("ignoring invalid node id in {}: {id_part}", path.display());
+            continue;
+        };
+        let scope = match parse_scope(scope_part.trim()) {
+            Some(scope) => scope,
+            None => {
+                tracing::warn!(
+                    node = id_part,
+                    file = %path.display(),
+                    "malformed scope; denying all apps for this device"
+                );
+                Scope::Ports(BTreeSet::new())
+            }
+        };
+        map.insert(id, scope);
+    }
+    map
+}
+
+/// Parse the scope half of a `device_scopes` line.
+fn parse_scope(text: &str) -> Option<Scope> {
+    if text == "all" {
+        return Some(Scope::All);
+    }
+    let ports: BTreeSet<u16> = text
+        .split(',')
+        .map(str::trim)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    Some(Scope::Ports(ports))
+}
+
+/// Persist the scope map atomically with `0600` permissions.
+fn save_scopes(path: &Path, scopes: &HashMap<String, Scope>) -> Result<()> {
+    let mut entries: Vec<(&String, &Scope)> = scopes.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut content = String::new();
+    for (id, scope) in entries {
+        let scope_str = match scope {
+            Scope::All => "all".to_string(),
+            Scope::Ports(ports) => ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        };
+        content.push_str(&format!("{id} {scope_str}\n"));
+    }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, content)?;
     identity::restrict(&tmp, 0o600);
@@ -665,10 +908,12 @@ mod tests {
                 invitations: HashMap::new(),
                 failed_attempts: 0,
                 revoked: HashMap::new(),
+                scopes: HashMap::new(),
                 next_generation: 0,
             }),
             store_path: std::env::temp_dir().join(format!("raemote-test-{name}")),
             names_path: std::env::temp_dir().join(format!("raemote-test-{name}.names")),
+            scopes_path: std::env::temp_dir().join(format!("raemote-test-{name}.scopes")),
             max_attempts: AtomicU32::new(3),
         }
     }
@@ -756,6 +1001,7 @@ mod tests {
         let reloaded = AuthState::load_at(
             state.store_path.clone(),
             state.names_path.clone(),
+            state.scopes_path.clone(),
             3,
         )
         .unwrap();
@@ -810,7 +1056,7 @@ mod tests {
     #[test]
     fn fixed_token_is_used_verbatim() {
         let state = test_state("fixed-token");
-        let info = state.mint_token_with(Duration::from_secs(60), Some("deadbeefdeadbeef"));
+        let info = state.mint_token_with(Duration::from_secs(60), Some("deadbeefdeadbeef"), Scope::All);
         assert_eq!(info.token_hex, "deadbeefdeadbeef");
         assert_eq!(
             state.authenticate(node(1), "deadbeefdeadbeef"),
@@ -822,7 +1068,7 @@ mod tests {
     fn huge_ttl_is_clamped_without_overflow() {
         let state = test_state("ttl-clamp");
         // u64::MAX would overflow `Instant::now() + ttl`; it must be clamped.
-        let info = state.mint_token_with(Duration::from_secs(u64::MAX), None);
+        let info = state.mint_token_with(Duration::from_secs(u64::MAX), None, Scope::All);
         assert_eq!(info.ttl, AuthState::MAX_TTL);
         assert!(state.current_token_info().is_some());
     }
@@ -878,7 +1124,7 @@ mod tests {
 
         // Persisted and reloaded with the same names.
         let reloaded =
-            AuthState::load_at(state.store_path.clone(), state.names_path.clone(), 3).unwrap();
+            AuthState::load_at(state.store_path.clone(), state.names_path.clone(), state.scopes_path.clone(), 3).unwrap();
         assert!(reloaded
             .device_infos()
             .iter()
@@ -910,7 +1156,7 @@ mod tests {
         assert!(state.revoke(node(1)));
 
         let reloaded =
-            AuthState::load_at(state.store_path.clone(), state.names_path.clone(), 3).unwrap();
+            AuthState::load_at(state.store_path.clone(), state.names_path.clone(), state.scopes_path.clone(), 3).unwrap();
         assert!(reloaded.device_infos().is_empty());
     }
 
@@ -923,7 +1169,7 @@ mod tests {
         // (display-only) name is lost.
         std::fs::write(&state.names_path, "not = [valid toml").unwrap();
         let reloaded =
-            AuthState::load_at(state.store_path.clone(), state.names_path.clone(), 3).unwrap();
+            AuthState::load_at(state.store_path.clone(), state.names_path.clone(), state.scopes_path.clone(), 3).unwrap();
         assert!(reloaded.is_authorized(node(1)));
         assert_eq!(reloaded.device_infos()[0].name, default_device_name(node(1)));
     }
@@ -951,7 +1197,7 @@ mod tests {
     fn invitation_authorizes_a_device_once() {
         let state = test_state("invite-once");
         let invite = state
-            .mint_invitation(Duration::from_secs(60), node(9), 3)
+            .mint_invitation(Duration::from_secs(60), node(9), 3, Scope::All)
             .unwrap();
 
         assert_eq!(
@@ -975,7 +1221,7 @@ mod tests {
         assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
 
         let invite = state
-            .mint_invitation(Duration::from_secs(60), node(1), 3)
+            .mint_invitation(Duration::from_secs(60), node(1), 3, Scope::All)
             .unwrap();
         // The already-paired device re-scans: nothing changes, invite not spent.
         assert_eq!(
@@ -992,7 +1238,7 @@ mod tests {
     fn expired_invitation_is_rejected() {
         let state = test_state("invite-expired");
         let invite = state
-            .mint_invitation(Duration::from_secs(60), node(9), 3)
+            .mint_invitation(Duration::from_secs(60), node(9), 3, Scope::All)
             .unwrap();
         if let Some(invitation) = state
             .inner
@@ -1014,19 +1260,19 @@ mod tests {
     #[test]
     fn outstanding_invitations_are_bounded() {
         let state = test_state("invite-bound");
-        assert!(state.mint_invitation(Duration::from_secs(60), node(9), 2).is_ok());
-        assert!(state.mint_invitation(Duration::from_secs(60), node(9), 2).is_ok());
-        assert!(state.mint_invitation(Duration::from_secs(60), node(9), 2).is_err());
+        assert!(state.mint_invitation(Duration::from_secs(60), node(9), 2, Scope::All).is_ok());
+        assert!(state.mint_invitation(Duration::from_secs(60), node(9), 2, Scope::All).is_ok());
+        assert!(state.mint_invitation(Duration::from_secs(60), node(9), 2, Scope::All).is_err());
     }
 
     #[test]
     fn invitations_are_independent() {
         let state = test_state("invite-independent");
         let first = state
-            .mint_invitation(Duration::from_secs(60), node(9), 3)
+            .mint_invitation(Duration::from_secs(60), node(9), 3, Scope::All)
             .unwrap();
         let second = state
-            .mint_invitation(Duration::from_secs(60), node(9), 3)
+            .mint_invitation(Duration::from_secs(60), node(9), 3, Scope::All)
             .unwrap();
         assert_ne!(first.token_hex, second.token_hex);
 
@@ -1039,5 +1285,230 @@ mod tests {
             state.authenticate(node(2), &second.token_hex),
             BindOutcome::BoundViaInvitation
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Device scopes
+    // ------------------------------------------------------------------
+
+    fn ports_scope(ports: &[u16]) -> Scope {
+        Scope::Ports(ports.iter().copied().collect())
+    }
+
+    #[test]
+    fn scope_from_ports_maps_none_to_all() {
+        assert_eq!(scope_from_ports(None), Scope::All);
+        assert_eq!(
+            scope_from_ports(Some(vec![3000, 8080])),
+            ports_scope(&[3000, 8080])
+        );
+        // An empty list is a valid (drastic) scope: paired but sees nothing.
+        assert_eq!(scope_from_ports(Some(vec![])), ports_scope(&[]));
+    }
+
+    #[test]
+    fn scope_allows_port_and_subset() {
+        let all = Scope::All;
+        let restricted = ports_scope(&[3000, 8080]);
+
+        assert!(all.allows_port(3000));
+        assert!(all.allows_port(1));
+        assert!(restricted.allows_port(3000));
+        assert!(restricted.allows_port(8080));
+        assert!(!restricted.allows_port(9999));
+
+        // Subset: restricted ⊆ all, but not the reverse.
+        assert!(restricted.is_subset_of(&all));
+        assert!(!all.is_subset_of(&restricted));
+        // A scope is a subset of itself.
+        assert!(restricted.is_subset_of(&restricted));
+        // Empty set is a subset of everything.
+        assert!(ports_scope(&[]).is_subset_of(&restricted));
+        // A superset is not a subset.
+        assert!(!ports_scope(&[3000, 8080, 9999]).is_subset_of(&restricted));
+    }
+
+    #[test]
+    fn token_scope_is_granted_at_bind() {
+        let state = test_state("token-scope");
+        let info = state.mint_token_with(Duration::from_secs(60), None, ports_scope(&[3000]));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+
+        assert_eq!(state.scope_for(node(1)), ports_scope(&[3000]));
+        assert!(state.can_access_port(node(1), 3000));
+        assert!(!state.can_access_port(node(1), 8080));
+    }
+
+    #[test]
+    fn invitation_scope_is_granted_at_redemption() {
+        let state = test_state("invite-scope");
+        // A full-access inviter mints a restricted invitation.
+        let info = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+        let invite = state
+            .mint_invitation(Duration::from_secs(60), node(1), 3, ports_scope(&[8080]))
+            .unwrap();
+
+        assert_eq!(
+            state.authenticate(node(2), &invite.token_hex),
+            BindOutcome::BoundViaInvitation
+        );
+        assert_eq!(state.scope_for(node(2)), ports_scope(&[8080]));
+        assert!(state.can_access_port(node(2), 8080));
+        assert!(!state.can_access_port(node(2), 3000));
+        // The inviter is unaffected.
+        assert_eq!(state.scope_for(node(1)), Scope::All);
+    }
+
+    #[test]
+    fn repairing_with_a_different_token_does_not_change_scope() {
+        let state = test_state("repair-scope");
+        let restricted = state.mint_token_with(Duration::from_secs(60), None, ports_scope(&[3000]));
+        assert_eq!(state.authenticate(node(1), &restricted.token_hex), BindOutcome::Bound);
+
+        // The device re-pairs with a full-access token: AlreadyAuthorized, and
+        // the original (narrower) scope is kept. There is no self-escalation.
+        let full = state.mint_token_with(Duration::from_secs(60), None, Scope::All);
+        assert_eq!(state.authenticate(node(1), &full.token_hex), BindOutcome::AlreadyAuthorized);
+        assert_eq!(state.scope_for(node(1)), ports_scope(&[3000]));
+    }
+
+    #[test]
+    fn set_scope_changes_and_persists() {
+        let state = test_state("set-scope");
+        let info = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+
+        // Starts full.
+        assert_eq!(state.scope_for(node(1)), Scope::All);
+
+        // Owner narrows it.
+        state.set_scope(node(1), ports_scope(&[3000])).unwrap();
+        assert_eq!(state.scope_for(node(1)), ports_scope(&[3000]));
+        assert!(state.can_access_port(node(1), 3000));
+        assert!(!state.can_access_port(node(1), 8080));
+
+        // Owner widens it back.
+        state.set_scope(node(1), Scope::All).unwrap();
+        assert_eq!(state.scope_for(node(1)), Scope::All);
+
+        // Persisted across a reload.
+        let reloaded = AuthState::load_at(
+            state.store_path.clone(),
+            state.names_path.clone(),
+            state.scopes_path.clone(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(reloaded.scope_for(node(1)), Scope::All);
+    }
+
+    #[test]
+    fn set_scope_on_unauthorized_device_fails() {
+        let state = test_state("set-scope-unauthorized");
+        assert!(state.set_scope(node(7), ports_scope(&[3000])).is_err());
+    }
+
+    #[test]
+    fn revoke_removes_the_scope() {
+        let state = test_state("revoke-scope");
+        let info = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+        state.set_scope(node(1), ports_scope(&[3000])).unwrap();
+        assert!(state.revoke(node(1)));
+
+        // A fresh load has no scope for the revoked device (and it is not
+        // authorized, so scope_for would not be called in production — but the
+        // file must not carry a stale grant).
+        let reloaded = AuthState::load_at(
+            state.store_path.clone(),
+            state.names_path.clone(),
+            state.scopes_path.clone(),
+            3,
+        )
+        .unwrap();
+        assert!(!reloaded.is_authorized(node(1)));
+        assert!(!reloaded
+            .scopes_path
+            .exists()
+            || std::fs::read_to_string(&reloaded.scopes_path)
+                .unwrap()
+                .lines()
+                .all(|l| !l.starts_with(&node(1).to_string())));
+    }
+
+    #[test]
+    fn corrupt_scope_line_fails_closed() {
+        let state = test_state("scope-corrupt");
+        let info = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+        state.set_scope(node(1), ports_scope(&[3000])).unwrap();
+
+        // Corrupt the scope line for node(1), then reload.
+        let content = std::fs::read_to_string(&state.scopes_path).unwrap();
+        let corrupted = content
+            .replace(&format!("{} ", node(1)), &format!("{} not-a-scope", node(1)));
+        std::fs::write(&state.scopes_path, corrupted).unwrap();
+
+        let reloaded = AuthState::load_at(
+            state.store_path.clone(),
+            state.names_path.clone(),
+            state.scopes_path.clone(),
+            3,
+        )
+        .unwrap();
+        // Fail-closed: the device is still authorized but sees no apps.
+        assert!(reloaded.is_authorized(node(1)));
+        assert_eq!(reloaded.scope_for(node(1)), ports_scope(&[]));
+        assert!(!reloaded.can_access_port(node(1), 3000));
+    }
+
+    #[test]
+    fn two_devices_with_different_scopes_are_isolated() {
+        let state = test_state("scope-isolation");
+        let info = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+        assert_eq!(state.authenticate(node(2), &info.token_hex), BindOutcome::Bound);
+
+        state.set_scope(node(1), ports_scope(&[3000])).unwrap();
+        state.set_scope(node(2), ports_scope(&[8080])).unwrap();
+
+        assert!(state.can_access_port(node(1), 3000));
+        assert!(!state.can_access_port(node(1), 8080));
+        assert!(state.can_access_port(node(2), 8080));
+        assert!(!state.can_access_port(node(2), 3000));
+
+        // Changing one does not affect the other.
+        state.set_scope(node(1), Scope::All).unwrap();
+        assert_eq!(state.scope_for(node(2)), ports_scope(&[8080]));
+    }
+
+    #[test]
+    fn scope_json_shape() {
+        assert_eq!(scope_json(&Scope::All), serde_json::json!({ "all": true }));
+        assert_eq!(
+            scope_json(&ports_scope(&[3000, 8080])),
+            serde_json::json!({ "all": false, "ports": [3000, 8080] })
+        );
+    }
+
+    #[test]
+    fn scope_roundtrips_through_the_store_file() {
+        let state = test_state("scope-roundtrip");
+        let info = state.mint_token(Duration::from_secs(60));
+        assert_eq!(state.authenticate(node(1), &info.token_hex), BindOutcome::Bound);
+        assert_eq!(state.authenticate(node(2), &info.token_hex), BindOutcome::Bound);
+        state.set_scope(node(1), ports_scope(&[3000, 8080])).unwrap();
+        state.set_scope(node(2), Scope::All).unwrap();
+
+        let reloaded = AuthState::load_at(
+            state.store_path.clone(),
+            state.names_path.clone(),
+            state.scopes_path.clone(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(reloaded.scope_for(node(1)), ports_scope(&[3000, 8080]));
+        assert_eq!(reloaded.scope_for(node(2)), Scope::All);
     }
 }

@@ -75,6 +75,12 @@ pub struct BindConfig {
     /// when it is no longer needed.
     #[serde(default)]
     pub token: Option<String>,
+    /// Default scope for pairing links this daemon mints: the ports a device
+    /// may reach. Empty means every app. A per-link `raemote pair --ports` or
+    /// `--all` overrides it for that link; setting it alongside a pinned
+    /// `token` keeps that link's restriction across restarts.
+    #[serde(default)]
+    pub allow_ports: Vec<u16>,
     /// Whether an authorized device may mint one-time invitations that pair
     /// another device (device-to-device onboarding).
     #[serde(default = "default_true")]
@@ -106,6 +112,7 @@ impl Default for BindConfig {
             max_failed_attempts: 10,
             max_concurrent_connections: 50,
             token: None,
+            allow_ports: Vec::new(),
             allow_invites: true,
             invite_ttl_secs: default_invite_ttl_secs(),
             max_pending_invites: default_max_pending_invites(),
@@ -276,7 +283,7 @@ pub fn load(path: &Path) -> Result<Config> {
         .with_context(|| format!("failed to read {}", path.display()))?;
     let mut config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    env_override(&mut config);
+    env_override(&mut config)?;
     Ok(config)
 }
 
@@ -300,7 +307,7 @@ pub fn load_or_init(path: &Path) -> Result<Config> {
 // Env overrides
 // ---------------------------------------------------------------------------
 
-fn env_override(config: &mut Config) {
+fn env_override(config: &mut Config) -> Result<()> {
     override_from_env(&mut config.bind.token_ttl_secs, "RAEMOTE_BIND_TTL_SECS");
     if let Ok(token) = std::env::var("RAEMOTE_BIND_TOKEN")
         && !token.trim().is_empty()
@@ -321,6 +328,22 @@ fn env_override(config: &mut Config) {
         &mut config.bind.max_pending_invites,
         "RAEMOTE_BIND_MAX_INVITES",
     );
+    // Strict on purpose: this value decides what every pairing link grants,
+    // so a typo must fail loudly — never parse to "no restriction" silently.
+    // An empty value is treated as unset (same convention as RAEMOTE_BIND_TOKEN).
+    if let Ok(ports) = std::env::var("RAEMOTE_BIND_ALLOW_PORTS")
+        && !ports.trim().is_empty()
+    {
+        let mut parsed = Vec::with_capacity(ports.split(',').count());
+        for entry in ports.split(',') {
+            let entry = entry.trim();
+            let port = entry.parse::<u16>().with_context(|| {
+                format!("invalid port {entry:?} in RAEMOTE_BIND_ALLOW_PORTS")
+            })?;
+            parsed.push(port);
+        }
+        config.bind.allow_ports = parsed;
+    }
     override_from_env(
         &mut config.serve.max_concurrent_streams,
         "RAEMOTE_MAX_CONCURRENT_STREAMS",
@@ -342,6 +365,7 @@ fn env_override(config: &mut Config) {
         "RAEMOTE_DISCOVERY_MAX_CONCURRENT_PROBES",
     );
     // RUST_LOG is handled by tracing-subscriber EnvFilter, not stored in config.
+    Ok(())
 }
 
 /// Apply an environment override if the variable is set and parses.
@@ -366,6 +390,11 @@ pub fn validate(config: &Config) -> Result<()> {
         && token.trim().len() < 16
     {
         errors.push("bind.token must be at least 16 characters".into());
+    }
+    for port in &config.bind.allow_ports {
+        if *port == 0 {
+            errors.push("bind.allow_ports entries must be > 0".into());
+        }
     }
     if config.bind.max_failed_attempts == 0 {
         errors.push("bind.max_failed_attempts must be > 0".into());
@@ -453,6 +482,10 @@ max_pending_invites = 3
 # restarts and lives as long as token_ttl_secs. Treat it as a long-lived secret.
 # token = "0123456789abcdef... (64+ random hex chars)"
 # token_ttl_secs = 3153600000   # ~100 years (clamped) for an effectively permanent link
+# Default access for pairing links this daemon mints (empty = all apps).
+# `raemote pair --ports` / `--all` overrides it per link; set it alongside a
+# pinned `token` so that link keeps its restriction across restarts.
+# allow_ports = [3000, 8080]
 
 [serve]
 max_concurrent_streams = 100
@@ -555,7 +588,7 @@ mod tests {
             std::env::set_var("RAEMOTE_BIND_TTL_SECS", "123");
         }
         let mut config = Config::default();
-        env_override(&mut config);
+        env_override(&mut config).unwrap();
         assert_eq!(config.bind.token_ttl_secs, 123);
         // SAFETY: single-threaded test, no concurrent env access
         unsafe {
@@ -571,11 +604,47 @@ mod tests {
             std::env::set_var("RAEMOTE_BIND_TTL_SECS", "not_a_number");
         }
         let mut config = Config::default();
-        env_override(&mut config);
+        env_override(&mut config).unwrap();
         assert_eq!(config.bind.token_ttl_secs, 300);
         // SAFETY: single-threaded test, no concurrent env access
         unsafe {
             std::env::remove_var("RAEMOTE_BIND_TTL_SECS");
+        }
+    }
+
+    #[test]
+    fn allow_ports_env_parses_comma_list() {
+        let _guard = env_guard();
+        // SAFETY: guarded by ENV_LOCK, no concurrent env access
+        unsafe {
+            std::env::set_var("RAEMOTE_BIND_ALLOW_PORTS", "3000, 8080");
+        }
+        let mut config = Config::default();
+        env_override(&mut config).unwrap();
+        assert_eq!(config.bind.allow_ports, vec![3000, 8080]);
+        // SAFETY: single-threaded test, no concurrent env access
+        unsafe {
+            std::env::remove_var("RAEMOTE_BIND_ALLOW_PORTS");
+        }
+    }
+
+    #[test]
+    fn allow_ports_env_rejects_a_bad_port_instead_of_failing_open() {
+        let _guard = env_guard();
+        // SAFETY: guarded by ENV_LOCK, no concurrent env access
+        unsafe {
+            std::env::set_var("RAEMOTE_BIND_ALLOW_PORTS", "3000,not-a-port");
+        }
+        let mut config = Config::default();
+        config.bind.allow_ports = vec![3000];
+        let err = env_override(&mut config).unwrap_err();
+        assert!(err.to_string().contains("RAEMOTE_BIND_ALLOW_PORTS"));
+        // The configured restriction is left untouched; only a valid env
+        // value replaces it (the error stops startup loudly either way).
+        assert_eq!(config.bind.allow_ports, vec![3000]);
+        // SAFETY: single-threaded test, no concurrent env access
+        unsafe {
+            std::env::remove_var("RAEMOTE_BIND_ALLOW_PORTS");
         }
     }
 
@@ -660,7 +729,7 @@ mod tests {
             std::env::set_var("RAEMOTE_BIND_TOKEN", "0123456789abcdef");
         }
         let mut config = Config::default();
-        env_override(&mut config);
+        env_override(&mut config).unwrap();
         assert_eq!(config.bind.token.as_deref(), Some("0123456789abcdef"));
         // SAFETY: single-threaded test, no concurrent env access
         unsafe {
@@ -705,7 +774,7 @@ mod tests {
             std::env::set_var("RAEMOTE_DISCOVERY_INTERVAL_SECS", "45");
         }
         let mut config = Config::default();
-        env_override(&mut config);
+        env_override(&mut config).unwrap();
         assert!(!config.discovery.enabled);
         assert_eq!(config.discovery.interval_secs, 45);
         // SAFETY: single-threaded test, no concurrent env access

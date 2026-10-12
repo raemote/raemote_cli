@@ -12,7 +12,7 @@ use iroh::protocol::Router;
 use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
 
-use crate::auth::AuthState;
+use crate::auth::{scope_from_ports, AuthState};
 use crate::bind::{BindHandler, BIND_ALPN};
 use crate::catalog::Catalog;
 use crate::config::{self, Config};
@@ -120,23 +120,70 @@ impl IpcHandler for DaemonState {
                     Response::Token(TokenResponse {
                         uri,
                         expires_at_unix: info.expires_at_unix,
+                        scope: info.scope,
                     })
                 }
                 None => Response::Error("no active token".into()),
             },
-            Request::RefreshToken { ttl_secs } => {
-                let (default_ttl, fixed) = {
+            Request::RefreshToken {
+                ttl_secs,
+                allow_ports,
+                full_access,
+            } => {
+                let (default_ttl, fixed, pinned_ports) = {
                     let cfg = self.config.read().expect("config poisoned");
-                    (cfg.bind.token_ttl_secs, cfg.bind.token.clone())
+                    (
+                        cfg.bind.token_ttl_secs,
+                        cfg.bind.token.clone(),
+                        cfg.bind.allow_ports.clone(),
+                    )
                 };
                 let ttl = Duration::from_secs(ttl_secs.unwrap_or(default_ttl));
-                let info = self.auth.mint_token_with(ttl, fixed.as_deref());
+                // Precedence: an explicit --ports, then an explicit --all,
+                // then the configured bind.allow_ports default, then full
+                // access (both when the config default is empty).
+                let config_scope = scope_from_ports(if pinned_ports.is_empty() {
+                    None
+                } else {
+                    Some(pinned_ports)
+                });
+                let scope = match (allow_ports, full_access) {
+                    (Some(ports), _) => scope_from_ports(Some(ports)),
+                    (None, true) => crate::auth::Scope::All,
+                    (None, false) => config_scope.clone(),
+                };
+                // A pinned link has the same value after a restart, so the
+                // config scope (applied at startup) is what will actually
+                // survive: warn when an ad-hoc restriction would be lost.
+                if fixed.is_some() && scope != config_scope {
+                    tracing::warn!(
+                        scope = %crate::auth::scope_json(&scope),
+                        restart_scope = %crate::auth::scope_json(&config_scope),
+                        "bind.token is pinned: this link's restriction differs from \
+                         bind.allow_ports and will be reset to it on restart"
+                    );
+                }
+                let info = self.auth.mint_token_with(ttl, fixed.as_deref(), scope);
                 let uri = info.uri(self.endpoint.id());
                 Response::Token(TokenResponse {
                     uri,
                     expires_at_unix: info.expires_at_unix,
+                    scope: info.scope,
                 })
             }
+            Request::SetDeviceAccess {
+                node_id,
+                allow_ports,
+            } => match node_id.parse::<iroh::EndpointId>() {
+                Ok(id) => {
+                    let scope = scope_from_ports(allow_ports);
+                    match self.auth.set_scope(id, scope) {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Error(e.to_string()),
+                    }
+                }
+                Err(_) => Response::Error(format!("invalid node id: {node_id}")),
+            },
             Request::Reload => match config::reload(&self.config_path) {
                 Ok(new_cfg) => {
                     if let Err(e) = config::validate(&new_cfg) {
@@ -189,6 +236,7 @@ impl IpcHandler for DaemonState {
                     .map(|d| ipc::DeviceInfo {
                         node_id: d.node_id.to_string(),
                         name: d.name,
+                        access: self.auth.scope_for(d.node_id),
                     })
                     .collect();
                 Response::Devices(devices)
@@ -323,7 +371,15 @@ pub async fn run() -> Result<()> {
 
     let auth = Arc::new(AuthState::load(cfg.bind.max_failed_attempts)?);
     let ttl = Duration::from_secs(cfg.bind.token_ttl_secs);
-    let token = auth.mint_token_with(ttl, cfg.bind.token.as_deref());
+    // `bind.allow_ports` is the default scope for every link this daemon
+    // mints (pinned or not); an explicit `raemote pair --ports`/`--all`
+    // overrides it per link.
+    let startup_scope = if cfg.bind.allow_ports.is_empty() {
+        crate::auth::Scope::All
+    } else {
+        crate::auth::scope_from_ports(Some(cfg.bind.allow_ports.clone()))
+    };
+    let token = auth.mint_token_with(ttl, cfg.bind.token.as_deref(), startup_scope);
 
     let config = Arc::new(RwLock::new(cfg));
     let config_generation = Arc::new(AtomicU64::new(0));

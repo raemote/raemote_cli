@@ -37,6 +37,14 @@ enum Commands {
         /// Lifetime of the newly minted link in seconds (overrides config)
         #[arg(long, value_name = "SECS")]
         ttl: Option<u64>,
+        /// Restrict the link to apps on these ports (comma-separated).
+        /// Without --ports or --all, the link uses the configured
+        /// `bind.allow_ports` default — or grants every app when that is empty.
+        #[arg(long, value_name = "PORTS", value_delimiter = ',')]
+        ports: Option<Vec<u16>>,
+        /// Grant every app, overriding a configured `bind.allow_ports` default
+        #[arg(long, conflicts_with = "ports")]
+        all: bool,
     },
     /// Pair with a server and browse its apps in a local web UI
     Connect {
@@ -126,6 +134,17 @@ enum DevicesCommands {
         /// The node id to revoke
         node_id: String,
     },
+    /// Change which apps a paired device may reach
+    Access {
+        /// The device node id
+        node_id: String,
+        /// Restrict to apps on these ports (comma-separated)
+        #[arg(long, value_name = "PORTS", value_delimiter = ',')]
+        ports: Option<Vec<u16>>,
+        /// Grant access to every app
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -189,7 +208,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Status { json } => cmd_status(json).await,
         Commands::Reload => cmd_reload().await,
-        Commands::Pair { no_refresh, json, ttl } => cmd_pair(no_refresh, json, ttl).await,
+        Commands::Pair {
+            no_refresh,
+            json,
+            ttl,
+            ports,
+            all,
+        } => cmd_pair(no_refresh, json, ttl, ports, all).await,
         Commands::Connect { target, port, no_open } => {
             raemote::connector::run(target.as_deref(), port, !no_open).await
         }
@@ -197,6 +222,11 @@ async fn main() -> Result<()> {
             DevicesCommands::List { json } => cmd_devices_list(json).await,
             DevicesCommands::Rename { node_id, name } => cmd_devices_rename(&node_id, &name).await,
             DevicesCommands::Revoke { node_id } => cmd_devices_revoke(&node_id).await,
+            DevicesCommands::Access {
+                node_id,
+                ports,
+                all,
+            } => cmd_devices_access(&node_id, ports, all).await,
         },
         Commands::Service { command } => match command {
             ServiceCommands::Install => cmd_service_install(),
@@ -358,7 +388,28 @@ fn humanize_duration(secs: u64) -> String {
     }
 }
 
-async fn cmd_pair(no_refresh: bool, json: bool, ttl: Option<u64>) -> Result<()> {
+/// Format a device scope for display.
+fn format_scope(scope: &raemote::auth::Scope) -> String {
+    match scope {
+        raemote::auth::Scope::All => "all apps".to_string(),
+        raemote::auth::Scope::Ports(ports) => {
+            if ports.is_empty() {
+                "no apps".to_string()
+            } else {
+                let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+                format!("ports {}", list.join(", "))
+            }
+        }
+    }
+}
+
+async fn cmd_pair(
+    no_refresh: bool,
+    json: bool,
+    ttl: Option<u64>,
+    ports: Option<Vec<u16>>,
+    all: bool,
+) -> Result<()> {
     if !daemon_running() {
         eprintln!("daemon is not running");
         std::process::exit(1);
@@ -366,7 +417,11 @@ async fn cmd_pair(no_refresh: bool, json: bool, ttl: Option<u64>) -> Result<()> 
     let req = if no_refresh {
         Request::GetToken
     } else {
-        Request::RefreshToken { ttl_secs: ttl }
+        Request::RefreshToken {
+            ttl_secs: ttl,
+            allow_ports: ports,
+            full_access: all,
+        }
     };
     match ipc_request(req).await? {
         Response::Token(t) => {
@@ -388,6 +443,7 @@ async fn cmd_pair(no_refresh: bool, json: bool, ttl: Option<u64>) -> Result<()> 
                     t.expires_at_unix
                 );
             }
+            println!("access  : {}", format_scope(&t.scope));
             println!("note    : one link can pair more than one device until it expires");
 
             // Render QR code
@@ -426,7 +482,12 @@ async fn cmd_devices_list(json: bool) -> Result<()> {
             } else {
                 println!("{} paired device(s):", devices.len());
                 for device in &devices {
-                    println!("  {:<24} {}", device.name, device.node_id);
+                    println!(
+                        "  {:<24} {}  [{}]",
+                        device.name,
+                        device.node_id,
+                        format_scope(&device.access)
+                    );
                 }
             }
             Ok(())
@@ -477,6 +538,46 @@ async fn cmd_devices_revoke(node_id: &str) -> Result<()> {
     match ipc_request(request).await? {
         Response::Ok => {
             println!("revoked device {node_id}");
+            Ok(())
+        }
+        Response::Error(message) => Err(anyhow::anyhow!("{message}")),
+        resp => Err(anyhow::anyhow!("unexpected response: {resp:?}")),
+    }
+}
+
+async fn cmd_devices_access(node_id: &str, ports: Option<Vec<u16>>, all: bool) -> Result<()> {
+    if !daemon_running() {
+        eprintln!("daemon is not running");
+        std::process::exit(1);
+    }
+    let node_id = node_id.trim();
+    if node_id.is_empty() {
+        return Err(anyhow::anyhow!("no node id given"));
+    }
+    // Exactly one of --ports or --all.
+    if all && ports.is_some() {
+        return Err(anyhow::anyhow!("--all and --ports are mutually exclusive"));
+    }
+    if !all && ports.is_none() {
+        return Err(anyhow::anyhow!(
+            "specify --ports <port,...> to restrict, or --all to grant every app"
+        ));
+    }
+    let scope = if all {
+        raemote::auth::Scope::All
+    } else {
+        raemote::auth::scope_from_ports(ports)
+    };
+    let allow_ports = scope
+        .ports()
+        .map(|set| set.iter().copied().collect::<Vec<u16>>());
+    let request = Request::SetDeviceAccess {
+        node_id: node_id.to_string(),
+        allow_ports,
+    };
+    match ipc_request(request).await? {
+        Response::Ok => {
+            println!("set access for {node_id} to: {}", format_scope(&scope));
             Ok(())
         }
         Response::Error(message) => Err(anyhow::anyhow!("{message}")),
@@ -1008,6 +1109,14 @@ fn cmd_config_get(key: &str) -> Result<()> {
         "bind.allow_invites" => Some(cfg.bind.allow_invites.to_string()),
         "bind.invite_ttl_secs" => Some(cfg.bind.invite_ttl_secs.to_string()),
         "bind.max_pending_invites" => Some(cfg.bind.max_pending_invites.to_string()),
+        "bind.allow_ports" => Some(
+            cfg.bind
+                .allow_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
         "serve.max_concurrent_streams" => Some(cfg.serve.max_concurrent_streams.to_string()),
         "serve.rate_limit.refill" => Some(cfg.serve.rate_limit.refill.to_string()),
         "serve.rate_limit.interval_ms" => Some(cfg.serve.rate_limit.interval_ms.to_string()),
@@ -1048,6 +1157,21 @@ async fn cmd_config_set(key: &str, value: &str) -> Result<()> {
         }
         "bind.max_pending_invites" => {
             cfg.bind.max_pending_invites = value.parse().context("invalid value")?;
+        }
+        "bind.allow_ports" => {
+            // Empty clears the default (every app); otherwise a comma list.
+            cfg.bind.allow_ports = if value.trim().is_empty() {
+                Vec::new()
+            } else {
+                value
+                    .split(',')
+                    .map(|port| {
+                        port.trim()
+                            .parse::<u16>()
+                            .with_context(|| format!("invalid port {port:?}"))
+                    })
+                    .collect::<Result<Vec<u16>, _>>()?
+            };
         }
         "serve.max_concurrent_streams" => {
             cfg.serve.max_concurrent_streams = value.parse().context("invalid value")?;

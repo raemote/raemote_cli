@@ -31,6 +31,21 @@ pub enum Request {
     RefreshToken {
         /// Override the configured token lifetime (seconds).
         ttl_secs: Option<u64>,
+        /// Restrict the token to these ports (comma-separated). `None` means
+        /// "no explicit restriction": the configured `bind.allow_ports`
+        /// default applies (or every app when that is empty).
+        allow_ports: Option<Vec<u16>>,
+        /// Explicitly grant every app, overriding `bind.allow_ports`.
+        /// Ignored when `allow_ports` is set.
+        #[serde(default)]
+        full_access: bool,
+    },
+    /// Change a paired device's access scope (owner-only).
+    SetDeviceAccess {
+        /// The device node id.
+        node_id: String,
+        /// Restrict to these ports. `None` grants every app.
+        allow_ports: Option<Vec<u16>>,
     },
     /// Reload config from disk.
     Reload,
@@ -151,6 +166,8 @@ pub struct DeviceInfo {
     pub node_id: String,
     /// Human-readable name (`device-<hex>` when the device has no name).
     pub name: String,
+    /// What this device may reach.
+    pub access: crate::auth::Scope,
 }
 
 /// Pairing token details, returned by [`Request::GetToken`] and
@@ -161,6 +178,8 @@ pub struct TokenResponse {
     pub uri: String,
     /// Unix expiry of the token.
     pub expires_at_unix: u64,
+    /// What a device pairing with this token may reach.
+    pub scope: crate::auth::Scope,
 }
 
 /// Result of [`Request::Reload`].

@@ -42,10 +42,14 @@ async fn main() -> Result<()> {
     let command = args.next().context(usage())?;
 
     let secret_key = load_or_create_client_key(key_path.as_deref())?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind()
-        .await?;
+    // Honor an outbound proxy for iroh relay/discovery traffic, exactly like
+    // `raemoted` does (ALL_PROXY / HTTP(S)_PROXY env, no config file here).
+    let mut builder = Endpoint::builder(presets::N0);
+    if let Some(proxy) = raemote::proxy::resolve(None)? {
+        eprintln!("using outbound proxy {}", raemote::proxy::redacted(&proxy));
+        builder = builder.proxy_url(proxy);
+    }
+    let endpoint = builder.secret_key(secret_key).bind().await?;
     println!("client node id: {}", endpoint.id());
 
     match command.as_str() {

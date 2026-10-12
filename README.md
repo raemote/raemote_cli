@@ -38,7 +38,8 @@ include `--no-service`, `--bin-dir <dir>` and `--proxy <url>`.
 ## Pair
 
 ```sh
-raemote pair                     # prints a raemote:// link and a QR code
+raemote pair                     # pairing link granting every app (QR code too)
+raemote pair --ports 3000,8080   # restricted link: only these apps
 ```
 
 Open the Raemote app, tap **+**, scan the QR code (or paste the link via
@@ -65,9 +66,11 @@ raemote connect [<uri|node-id>]       # browse this server's apps in a local web
 raemote apps list                     # what was found, plus manual entries
 raemote apps add <name> <port>        # pin an app discovery missed
 raemote apps hide <name|host:port>    # hide a false positive (unhide restores it)
-raemote devices list                  # paired devices
+raemote devices list                  # paired devices (with each one's access)
 raemote devices rename <node-id> "Leo's iPhone"
 raemote devices revoke <node-id>      # cut a device off
+raemote devices access <node-id> --ports 3000,8080   # restrict to these apps
+raemote devices access <node-id> --all               # restore full access
 raemote config set name "Living Room Mac mini"
 raemote doctor                        # health check — start here when something's off
 raemote logs -n 50                    # recent activity (--follow to stream)
@@ -79,6 +82,18 @@ raemote stop | start | restart
 - **Discovery** is automatic and temporary; `raemote apps add` entries are
   permanent. An app must answer `GET /` like a web page — `raemote discover
   --verbose` lists every listener that was skipped and why.
+- **Per-device access**: by default a paired device reaches every app. Mint a
+  restricted pairing link with `raemote pair --ports 3000,8080`, or narrow an
+  already-paired device with `raemote devices access <node-id> --ports …`
+  (`--all` restores full access). Restricted devices only *see* the apps in
+  their allowlist, and any attempt to open another returns `403`. A paired
+  device's **Invite Device…** link can only ever grant a subset of what that
+  device already has — it can never widen access, so sharing on to a friend
+  stays within your original grant. To make restriction the default for every
+  link this server mints, set `bind.allow_ports = [3000, 8080]` in config
+  (`raemote config set bind.allow_ports 3000,8080` works too); a per-link
+  `raemote pair --ports`/`--all` overrides it, and setting it alongside a
+  pinned `token` keeps that link's restriction across restarts.
 - **Long-lived pairing link**: pin a token in `~/.raemote/config.toml`
   (`[bind]` → `token = "…64 hex…"`, `token_ttl_secs = 3153600000`) or set
   `RAEMOTE_BIND_TOKEN`, then `raemote pair`. That link is a secret — anyone

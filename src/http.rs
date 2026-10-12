@@ -27,7 +27,8 @@ use leaky_bucket::RateLimiter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use crate::auth::{default_device_name, sanitize_device_name, AuthState};
+use crate::auth::{default_device_name, scope_from_ports, scope_json, sanitize_device_name, AuthState, Scope};
+use crate::catalog::CatalogApp;
 use crate::catalog::Catalog;
 use crate::config::Config;
 use crate::discovery::model::Origin;
@@ -391,19 +392,19 @@ async fn handle(
     );
 
     if path == "/_hub/catalog" {
-        let resp = catalog(&state);
+        let resp = catalog(&state, &auth, node);
         tracing::info!(status = %resp.status(), "responding with catalog");
         return Ok(resp);
     }
 
     if path == "/_hub/discover" {
-        let resp = discover(&state).await;
+        let resp = discover(&state, &auth, node).await;
         tracing::info!(status = %resp.status(), "responding with discovery result");
         return Ok(resp);
     }
 
     if path == "/_hub/info" {
-        return Ok(info(&state));
+        return Ok(info(&state, &auth, node));
     }
 
     if path == "/_hub/devices" {
@@ -424,7 +425,7 @@ async fn handle(
 
     if path == "/_hub/invite" {
         if method == Method::POST {
-            return Ok(create_invite(&state, &auth, node));
+            return Ok(create_invite(&state, &auth, node, req).await);
         }
         return Ok(error_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -445,6 +446,18 @@ async fn handle(
         };
         match origin {
             Some(origin) => {
+                // Scope gate: a restricted device may only reach apps its
+                // scope allows. Checked after name→origin resolution so the
+                // decision is about the actual upstream, not the label.
+                if !auth.can_access_port(node, origin.port) {
+                    tracing::warn!(app = %name, port = origin.port, "app not shared with this device");
+                    return Ok(error_response(
+                        StatusCode::FORBIDDEN,
+                        "not_allowed_for_device",
+                        &format!("app \"{name}\" is not shared with this device"),
+                        Some("the server owner can grant access with `raemote devices access`"),
+                    ));
+                }
                 tracing::info!(app = %name, authority = %origin.authority(), sub_path, "proxying to origin");
                 return proxy(&state, req, &origin, sub_path).await;
             }
@@ -471,9 +484,9 @@ async fn handle(
 
 /// Trigger an immediate discovery scan (if wired) and wait briefly for it to
 /// finish, then return the refreshed catalog.
-async fn discover(state: &AppState) -> Response<ResBody> {
+async fn discover(state: &AppState, auth: &AuthState, node: EndpointId) -> Response<ResBody> {
     let Some(handle) = &state.discovery else {
-        return catalog(state);
+        return catalog(state, auth, node);
     };
     let before = handle.generation.load(Ordering::Relaxed);
     handle.trigger.notify_one();
@@ -483,13 +496,28 @@ async fn discover(state: &AppState) -> Response<ResBody> {
     {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    catalog(state)
+    catalog(state, auth, node)
 }
 
-fn catalog(state: &AppState) -> Response<ResBody> {
+/// The catalog as this device may see it: apps outside its scope are omitted,
+/// so a restricted device never learns what it cannot reach.
+fn catalog(state: &AppState, auth: &AuthState, node: EndpointId) -> Response<ResBody> {
     let catalog = state.catalog.read().expect("catalog poisoned");
-    let apps: Vec<_> = catalog.apps().iter().map(catalog_app_json).collect();
+    let scope = auth.scope_for(node);
+    let apps: Vec<_> = visible_apps(&catalog, &scope)
+        .into_iter()
+        .map(catalog_app_json)
+        .collect();
     json_response(StatusCode::OK, serde_json::json!({ "apps": apps }))
+}
+
+/// The catalog entries a device with `scope` may see.
+fn visible_apps<'a>(catalog: &'a Catalog, scope: &Scope) -> Vec<&'a CatalogApp> {
+    catalog
+        .apps()
+        .iter()
+        .filter(|app| scope.allows_port(app.origin.port))
+        .collect()
 }
 
 /// One catalog entry in the hub JSON shape the client decodes.
@@ -506,7 +534,10 @@ fn catalog_app_json(app: &crate::catalog::CatalogApp) -> serde_json::Value {
 }
 
 /// `GET /_hub/info`: basic server identity for the app to display.
-fn info(state: &AppState) -> Response<ResBody> {
+///
+/// `access` reports the calling device's own scope, so a restricted client can
+/// show "limited access" without a separate round-trip.
+fn info(state: &AppState, auth: &AuthState, node: EndpointId) -> Response<ResBody> {
     let name = {
         let cfg = state.config.read().expect("config poisoned");
         crate::config::server_name(&cfg)
@@ -516,6 +547,7 @@ fn info(state: &AppState) -> Response<ResBody> {
         serde_json::json!({
             "name": name,
             "version": env!("CARGO_PKG_VERSION"),
+            "access": scope_json(&auth.scope_for(node)),
         }),
     )
 }
@@ -633,8 +665,17 @@ async fn rename_self(
 
 /// `POST /_hub/invite`: mint a one-time invitation so this (authorized) device
 /// can introduce another device to the server. Whoever redeems the returned
-/// link first becomes an authorized device; the invitation is then consumed.
-fn create_invite(state: &AppState, auth: &AuthState, node: EndpointId) -> Response<ResBody> {
+/// link first becomes an authorized device; the invitation is consumed.
+///
+/// The body may narrow the invitee's scope: `{"ports": [3000, 8080]}`. The
+/// requested scope must be a subset of the inviter's own — a device can never
+/// widen its grant by inviting. No body inherits the inviter's full scope.
+async fn create_invite(
+    state: &AppState,
+    auth: &AuthState,
+    node: EndpointId,
+    req: Request<Incoming>,
+) -> Response<ResBody> {
     let (allow, ttl_secs, max_pending) = {
         let cfg = state.config.read().expect("config poisoned");
         (
@@ -653,7 +694,59 @@ fn create_invite(state: &AppState, auth: &AuthState, node: EndpointId) -> Respon
         );
     }
 
-    match auth.mint_invitation(Duration::from_secs(ttl_secs), node, max_pending) {
+    // Parse the optional body. An empty body (or no body) inherits the
+    // inviter's scope; `{"ports": [...]}` narrows it.
+    let requested = match collect_limited_body(req).await {
+        Ok(body) if body.is_empty() => None,
+        Ok(body) => {
+            #[derive(serde::Deserialize)]
+            struct InviteBody {
+                ports: Option<Vec<u16>>,
+            }
+            match serde_json::from_slice::<InviteBody>(&body) {
+                Ok(parsed) => parsed.ports,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "bad_request",
+                        "expected a JSON body like {\"ports\": [3000, 8080]}",
+                        None,
+                    );
+                }
+            }
+        }
+        Err(LimitError::TooLarge) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                "request body too large",
+                None,
+            );
+        }
+        Err(LimitError::Io) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "could not read the request body",
+                None,
+            );
+        }
+    };
+
+    let inviter_scope = auth.scope_for(node);
+    let scope = match resolve_invite_scope(&inviter_scope, requested) {
+        Ok(scope) => scope,
+        Err(message) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "beyond_grant",
+                message,
+                Some("the inviter's own access is the ceiling"),
+            );
+        }
+    };
+
+    match auth.mint_invitation(Duration::from_secs(ttl_secs), node, max_pending, scope.clone()) {
         Ok(info) => {
             tracing::info!(node = %node.fmt_short(), "invitation requested");
             json_response(
@@ -661,6 +754,7 @@ fn create_invite(state: &AppState, auth: &AuthState, node: EndpointId) -> Respon
                 serde_json::json!({
                     "uri": info.uri(state.node_id),
                     "expires_at_unix": info.expires_at_unix,
+                    "access": scope_json(&scope),
                 }),
             )
         }
@@ -670,6 +764,28 @@ fn create_invite(state: &AppState, auth: &AuthState, node: EndpointId) -> Respon
             &err.to_string(),
             Some("wait for an outstanding invitation to expire or be used"),
         ),
+    }
+}
+
+/// Compute the scope for a new invitation: the requested ports narrowed to
+/// the inviter's own scope. `None` inherits the inviter's full scope.
+///
+/// This is the no-escalation choke point: an invitation can never be wider
+/// than the device that minted it.
+fn resolve_invite_scope(
+    inviter_scope: &Scope,
+    requested: Option<Vec<u16>>,
+) -> std::result::Result<Scope, &'static str> {
+    match requested {
+        None => Ok(inviter_scope.clone()),
+        Some(ports) => {
+            let requested_scope = scope_from_ports(Some(ports));
+            if requested_scope.is_subset_of(inviter_scope) {
+                Ok(requested_scope)
+            } else {
+                Err("an invitation cannot grant more than the inviter has")
+            }
+        }
     }
 }
 
@@ -1360,5 +1476,92 @@ mod tests {
 
         // After reload, a new limiter should be created (old one dropped from cache)
         assert!(!Arc::ptr_eq(&limiter1, &limiter2));
+    }
+
+    // ------------------------------------------------------------------
+    // Device scopes
+    // ------------------------------------------------------------------
+
+    fn scope_ports(ports: &[u16]) -> Scope {
+        Scope::Ports(ports.iter().copied().collect())
+    }
+
+    fn test_catalog() -> Catalog {
+        use crate::discovery::model::DiscoveredApp;
+        Catalog::rebuild(
+            &[crate::config::AppConfig {
+                name: "manual".into(),
+                port: 9000,
+            }],
+            &[
+                DiscoveredApp {
+                    origin: crate::discovery::model::Origin::http("127.0.0.1", 3000),
+                    title: Some("App A".into()),
+                    icon: None,
+                    process: None,
+                    pid: None,
+                },
+                DiscoveredApp {
+                    origin: crate::discovery::model::Origin::http("127.0.0.1", 8080),
+                    title: Some("App B".into()),
+                    icon: None,
+                    process: None,
+                    pid: None,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn visible_apps_filters_by_scope() {
+        let catalog = test_catalog();
+        let all = Scope::All;
+        let restricted = scope_ports(&[3000]);
+
+        // Full scope sees everything.
+        let names: Vec<_> = visible_apps(&catalog, &all)
+            .into_iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["manual", "app-a", "app-b"]);
+
+        // Restricted scope sees only the allowed port.
+        let names: Vec<_> = visible_apps(&catalog, &restricted)
+            .into_iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["app-a"]);
+
+        // An empty scope sees nothing.
+        let empty = scope_ports(&[]);
+        assert!(visible_apps(&catalog, &empty).is_empty());
+    }
+
+    #[test]
+    fn resolve_invite_scope_inherits_or_narrows() {
+        let all = Scope::All;
+        let restricted = scope_ports(&[3000, 8080]);
+
+        // No request inherits the inviter's scope.
+        assert_eq!(resolve_invite_scope(&all, None).unwrap(), all);
+        assert_eq!(resolve_invite_scope(&restricted, None).unwrap(), restricted);
+
+        // A subset is allowed.
+        assert_eq!(
+            resolve_invite_scope(&restricted, Some(vec![3000])).unwrap(),
+            scope_ports(&[3000])
+        );
+
+        // A superset is rejected.
+        assert!(resolve_invite_scope(&restricted, Some(vec![3000, 9999])).is_err());
+
+        // A full-scope inviter can mint any restriction.
+        assert_eq!(
+            resolve_invite_scope(&all, Some(vec![3000])).unwrap(),
+            scope_ports(&[3000])
+        );
+
+        // A restricted inviter cannot mint a full-scope invite.
+        assert!(resolve_invite_scope(&restricted, Some(vec![3000, 8080, 9999])).is_err());
     }
 }
