@@ -8,9 +8,11 @@ Use the web apps running on your computer — from your phone, laptop, anywhere.
 
 `raemoted` is a small server daemon you run on your own machine. It finds the web apps
 already running there (Jellyfin, Home Assistant, a dev server — anything on
-`http://localhost`) and makes them reachable from the `Raemote iOS app` or `raemote` cli tool. No
-account, no VPN, no port forwarding: the connection is end-to-end encrypted and
-goes direct when it can, otherwise through a public relay.
+`http://localhost`) and makes them reachable from two clients that ship with it:
+the **Raemote iOS app** and **`raemote connect`**, a browser client that serves
+the same apps from any computer. No account, no VPN, no port forwarding: the
+connection is end-to-end encrypted and goes direct when it can, otherwise
+through a public relay.
 
 Think of this as an encrypted, p2p connected and super easy to setup reverse proxy.
 
@@ -46,19 +48,30 @@ raemote pair --ports 3000,8080   # restricted link: only these apps
 ```
 
 Open the Raemote app, tap **+**, scan the QR code (or paste the link via
-**Manual Setup**). You only do this once. Already paired? Any paired device can
-introduce another: **server → … → Invite Device…** shows a one-time code.
+**Manual Setup**). The same link pairs a computer instead — or as well (see
+[Connect](#connect)). You only do this once per device. Already paired? Any
+paired device can introduce another: **server → … → Invite Device…** shows a
+one-time code.
 
-The CLI can browse the same catalog itself, on a different machine:
+## Connect
+
+`raemote connect` is Raemote's browser client — your apps in a desktop
+browser, over the same encrypted tunnel as the phone app:
 
 ```sh
-raemote connect '<link from raemote pair>'   # pairs this machine, opens a local web UI
-raemote connect                              # reopens the last one
+raemote connect '<link from raemote pair>'   # pair this machine, open the web UI
+raemote connect                              # reopen the last server
 ```
 
 It serves the app list at `http://127.0.0.1:7788` (`--port <n>` moves it,
-`--no-open` skips the browser). Each app then opens on **its own**
-`127.0.0.1` port (7790+).
+`--no-open` skips the browser), and every app then opens on **its own**
+`127.0.0.1` port (7790+) — so relative URLs, cookies and logins behave exactly
+as they do on the server. Requests stream end to end: bodies, server-sent
+events and WebSockets pass through untouched. It runs on the server machine or
+any other computer.
+
+The paired computer shows up in `raemote devices list` like any phone — give it
+a name, restrict it with `--ports`, revoke it when you're done.
 
 ## Commands
 
@@ -115,8 +128,11 @@ raemote stop | start | restart
 GitHub: <https://github.com/raemote/raemote_cli> — Gitee mirror:
 <https://gitee.com/pppkin/raemote_cli>
 
-Phone app: <https://github.com/raemote/raemote_connector_ios> — Gitee mirror:
+iOS app: <https://github.com/raemote/raemote_connector_ios> — Gitee mirror:
 <https://gitee.com/pppkin/raemote_connector_ios>
+
+Browser client (`raemote connect`): see [Connect](#connect) above — it lives in
+this repo and crate.
 
 ## License
 
