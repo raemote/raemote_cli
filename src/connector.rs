@@ -965,7 +965,7 @@ fn app_row(app: &CatalogEntry, port: Option<u16>) -> String {
         None => format!("/app/{}", esc(&app.name)),
     };
     format!(
-        "<a class=\"app\" href=\"{href}\">{}<span><b>{}</b><small>:{}</small></span></a>",
+        "<a class=\"app\" href=\"{href}\" target=\"_blank\" rel=\"noopener\">{}<span><b>{}</b><small>:{}</small></span></a>",
         media,
         esc(label),
         app.port
@@ -1488,6 +1488,47 @@ mod tests {
         assert!(page.contains(":8080"));
         assert!(page.contains("raemote 0.1.3"));
         assert!(!page.contains("__SUMMARY__"), "all tokens replaced");
+    }
+
+    #[test]
+    fn app_rows_open_in_a_new_tab_so_the_catalog_stays_open() {
+        let info = ServerInfo {
+            name: "Mini".to_string(),
+            version: None,
+        };
+        let apps = vec![
+            CatalogEntry {
+                name: "wiki".to_string(),
+                title: None,
+                icon: None,
+                port: 8080,
+            },
+            CatalogEntry {
+                name: "notes".to_string(),
+                title: None,
+                icon: None,
+                port: 3000,
+            },
+        ];
+        let mut ports = HashMap::new();
+        ports.insert("wiki".to_string(), 7791u16);
+        let page = render_page(&info, &apps, &ports);
+        // Both link shapes — own origin and path fallback — open in a new tab
+        // with no opener handed to the app (different port = different origin).
+        assert_eq!(
+            page.matches("target=\"_blank\" rel=\"noopener\"").count(),
+            2,
+            "every app card opens in a new tab"
+        );
+        assert!(page.contains(
+            "<a class=\"app\" href=\"http://127.0.0.1:7791/\" target=\"_blank\" rel=\"noopener\">"
+        ));
+        assert!(page.contains(
+            "<a class=\"app\" href=\"/app/notes\" target=\"_blank\" rel=\"noopener\">"
+        ));
+        // Refresh navigates the catalog itself — it must stay in this tab.
+        assert!(page.contains("<a class=\"btn\" href=\"/?refresh=1\">Refresh</a>"));
+        assert!(!page.contains("/?refresh=1\" target"), "Refresh is not a new tab");
     }
 
     #[test]
