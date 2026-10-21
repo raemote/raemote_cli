@@ -42,7 +42,7 @@ jobs:
   mirror:
     # A failed release build has nothing to mirror.
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 

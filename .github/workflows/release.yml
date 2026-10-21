@@ -21,7 +21,7 @@ jobs:
           - runner: macos-15
             target: x86_64-apple-darwin
             asset: raemote-darwin-x86_64
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: raemote-linux-x86_64
           - runner: ubuntu-24.04-arm
@@ -53,7 +53,7 @@ jobs:
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v7
         with:
