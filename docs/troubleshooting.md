@@ -38,7 +38,16 @@ scripts/lan-http-scan.py                       # every LAN + common web ports
 scripts/lan-http-scan.py --cidr 192.168.1.0/24 --ports 80,8080,3000-3010
 scripts/lan-http-scan.py --all                 # also open ports that aren't HTTP
 scripts/lan-http-scan.py --json | jq -r '.http[].url'
+scripts/lan-http-scan.py --explain 192.168.1.20:3000   # one target, port by port
 ```
+
+A service you can open in a browser but the scan misses is almost always a
+sleeping Wi-Fi device: the first packet to it takes hundreds of milliseconds, so
+a one-shot 0.35 s connect probe times out. The scan already retries timed-out
+ports on hosts that are awake, with a 3× deadline; `--timeout 1 --retries 2`
+goes further. `--explain <ip>:<port>` tells you exactly which of the two
+happened (`refused` = host answered, nothing listening; `timed out` = no answer;
+`unreachable` = no route), and whether the host is even in the neighbour table.
 
 Open one of the printed URLs **on the device that can't connect**:
 

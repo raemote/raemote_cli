@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import errno
 import ipaddress
 import json
 import re
@@ -172,12 +173,46 @@ def is_private(net: ipaddress.IPv4Network) -> bool:
 # Scanning
 # ---------------------------------------------------------------------------
 
-def port_open(host: str, port: int, timeout: float) -> bool:
+OPEN, REFUSED, TIMEOUT, UNREACHABLE, ERROR = "open", "refused", "timeout", "unreachable", "error"
+
+
+def port_state(host: str, port: int, timeout: float) -> tuple[str, int]:
+    """Probe one TCP port, and say *why* it failed when it did.
+
+    The distinction matters: `refused` is a host that answered (nothing
+    listening), `timeout` is often a sleeping Wi-Fi device or a firewall, and
+    `unreachable` on every host usually means the terminal lacks macOS "Local
+    Network" permission rather than a dead network.
+    """
+    started = time.monotonic()
     try:
         with socket.create_connection((host, port), timeout):
-            return True
-    except OSError:
-        return False
+            return OPEN, int((time.monotonic() - started) * 1000)
+    except ConnectionRefusedError:
+        return REFUSED, int((time.monotonic() - started) * 1000)
+    except (socket.timeout, TimeoutError):
+        return TIMEOUT, int((time.monotonic() - started) * 1000)
+    except OSError as e:
+        state = UNREACHABLE if e.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH,
+                                          errno.EHOSTDOWN, errno.ENETDOWN) else ERROR
+        return state, int((time.monotonic() - started) * 1000)
+
+
+def arp_table() -> dict[str, str]:
+    """ip -> MAC from the neighbour table, to tell "host up but filtering TCP"
+    from "host not on this network at all". Best effort; empty when unavailable."""
+    table: dict[str, str] = {}
+    if sys.platform == "darwin":
+        for line in _run(["arp", "-an"]).splitlines():
+            match = re.search(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-f:]+)", line)
+            if match:
+                table[match.group(1)] = match.group(2)
+    else:
+        for line in _run(["ip", "-4", "neigh", "show"]).splitlines():
+            fields = line.split()
+            if len(fields) >= 5 and fields[1] == "lladdr":
+                table[fields[0]] = fields[2]
+    return table
 
 
 def _read_head(sock: socket.socket, limit: int = 16384) -> bytes:
@@ -309,31 +344,73 @@ def probe(host: str, port: int, timeout: float) -> dict:
             "redirect": ""}
 
 
-def scan(hosts: list[str], ports: list[int], timeout: float, workers: int) -> tuple[list[dict], int]:
-    open_ports: list[tuple[str, int]] = []
-    done = 0
-    total = len(hosts) * len(ports)
+def _sweep(pairs: list[tuple[str, int]], timeout: float, workers: int,
+           progress=None) -> dict[tuple[str, int], tuple[str, int]]:
+    states: dict[tuple[str, int], tuple[str, int]] = {}
+    if not pairs:
+        return states
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(port_open, host, port, timeout): (host, port)
-            for host in hosts
-            for port in ports
-        }
+        futures = {pool.submit(port_state, host, port, timeout): (host, port)
+                   for host, port in pairs}
         for future in concurrent.futures.as_completed(futures):
-            done += 1
-            if future.result():
-                open_ports.append(futures[future])
-            if done % 512 == 0 and sys.stderr.isatty():
-                print(f"\r  {done}/{total} probes, {len(open_ports)} open…", end="", file=sys.stderr)
-    if sys.stderr.isatty() and total >= 512:
-        print("\r" + " " * 48 + "\r", end="", file=sys.stderr)
+            states[futures[future]] = future.result()
+            if progress:
+                progress(len(states))
+    return states
 
+
+def scan(hosts: list[str], ports: list[int], timeout: float, workers: int,
+         retries: int = 1) -> tuple[list[dict], dict]:
+    pairs = [(host, port) for host in hosts for port in ports]
+    total = len(pairs)
+
+    def progress(done: int) -> None:
+        if done % 512 == 0 and sys.stderr.isatty():
+            print(f"\r  {done}/{total} probes…", end="", file=sys.stderr)
+
+    states = _sweep(pairs, timeout, workers, progress)
+    if sys.stderr.isatty() and total >= 512:
+        print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+
+    attempts = 1
+    if retries > 0:
+        # A second look with a longer deadline, but only for hosts that are
+        # demonstrably awake (they answered on some port, or the neighbour table
+        # knows their MAC). Wi-Fi devices take hundreds of milliseconds to answer
+        # the first packet — a single 0.35 s probe misses a service you can open
+        # in a browser — while a host that is simply absent is not worth retrying.
+        alive = {host for (host, _port), (state, _ms) in states.items()
+                 if state in (OPEN, REFUSED)}
+        arp = arp_table()
+        alive.update(host for host in hosts if host in arp)
+        retry = [hp for hp, (state, _ms) in states.items()
+                 if state in (TIMEOUT, ERROR) and hp[0] in alive]
+        if retry:
+            attempts += 1
+            states.update(_sweep(retry, timeout * 3, workers))
+
+    open_ports = [hp for hp, (state, _) in states.items() if state == OPEN]
     results: list[dict] = []
-    if not open_ports:
-        return results, 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(open_ports))) as pool:
-        results = list(pool.map(lambda hp: probe(hp[0], hp[1], timeout), open_ports))
-    return results, len(open_ports)
+    if open_ports:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(open_ports))) as pool:
+            results = list(pool.map(lambda hp: probe(hp[0], hp[1], timeout * 2), open_ports))
+
+    counts = {state: 0 for state in (OPEN, REFUSED, TIMEOUT, UNREACHABLE, ERROR)}
+    for state, _ in states.values():
+        counts[state] += 1
+    silent: dict[str, str] = {}
+    for (host, _port), (state, _ms) in states.items():
+        if state in (TIMEOUT, UNREACHABLE):
+            silent.setdefault(host, state)
+        elif state == OPEN:
+            silent.pop(host, None)
+    stats = {
+        "probes": total,
+        "attempts": attempts,
+        "counts": counts,
+        "silent_hosts": sorted(silent, key=ipaddress.IPv4Address),
+    }
+    return results, stats
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +487,75 @@ def fmt_table(rows: list[dict], mine: str | None, show_all: bool) -> str:
     return "\n".join(lines)
 
 
+def _state_label(state: str) -> str:
+    return {
+        OPEN: "open",
+        REFUSED: "refused (host answered: nothing listening)",
+        TIMEOUT: "timed out (no answer)",
+        UNREACHABLE: "unreachable (no route)",
+        ERROR: "error",
+    }[state]
+
+
+def explain(target: str, ports: list[int], timeout: float, retries: int) -> int:
+    """Explain one target, port by port — for when a service is missing from a scan."""
+    host, port = target, None
+    if target.count(":") == 1:
+        name, _, tail = target.partition(":")
+        if tail.isdigit():
+            host, port = name, int(tail)
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        print(f"raemote lan-scan: {host!r} is not an IPv4 address "
+              f"(this scanner is IPv4 only)", file=sys.stderr)
+        return 2
+
+    scan_ports = [port] if port else ports
+    mine = local_ip()
+    nets = local_networks()
+    inside = [str(n) for n in nets if ipaddress.IPv4Address(host) in n]
+    print(f"target   : {host}" + (f" ({'in ' + ', '.join(inside) if inside else 'outside every local network'})"))
+    print(f"this host: {mine or 'unknown'}")
+    print(f"probing  : {len(scan_ports)} port(s), timeout {timeout}s, {retries} retry(ies)")
+    print()
+
+    open_ports: list[int] = []
+    for candidate in scan_ports:
+        state, ms = port_state(host, candidate, timeout)
+        tries = 1
+        while state in (TIMEOUT, ERROR) and tries <= retries:
+            tries += 1
+            state, ms = port_state(host, candidate, timeout * 3)
+        note = f"{state} after {tries} attempt(s)" if tries > 1 else state
+        extra = ""
+        if state == OPEN:
+            open_ports.append(candidate)
+            result = probe(host, candidate, timeout * 2)
+            if result["status"] is not None:
+                detail = result["title"] or result["redirect"] or result["reason"]
+                extra = f"  {result['scheme']} {result['status']} {detail}"
+                extra = extra.rstrip()
+            else:
+                extra = f"  {result['not_http']}"
+        print(f"  {host}:{candidate:<6} {_state_label(state) if state != OPEN else 'open'} "
+              f"{ms:>5} ms ({note}){extra}")
+
+    if open_ports:
+        print(f"\n{len(open_ports)} of {len(scan_ports)} port(s) open: "
+              + ", ".join(str(p) for p in open_ports))
+        return 0
+    print("\nnothing open.")
+    arp = arp_table()
+    if host in arp:
+        print(f"{host} is in the neighbour table (MAC {arp[host]}), so the host is up "
+              f"but nothing answered on these ports — a firewall, or the ports moved.")
+    else:
+        print(f"{host} is not in the neighbour table: no ARP reply, so this machine cannot "
+              f"reach it at all (wrong network, VPN/proxy routing, or the host is off).")
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Scan the local network for HTTP services (a raemote fallback check).",
@@ -429,6 +575,10 @@ def main() -> int:
                         help="also scan non-private ranges (default: refuse)")
     parser.add_argument("--all", action="store_true",
                         help="also list open ports that did not answer HTTP")
+    parser.add_argument("--retries", type=int, default=1, metavar="N",
+                        help="extra attempts for ports that timed out (default: 1)")
+    parser.add_argument("--explain", metavar="IP[:PORT]", default="",
+                        help="probe one target port by port and explain the result, then exit")
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("-q", "--quiet", action="store_true", help="print URLs only")
     args = parser.parse_args()
@@ -438,6 +588,9 @@ def main() -> int:
     except ValueError as e:
         print(f"raemote lan-scan: {e}", file=sys.stderr)
         return 2
+
+    if args.explain:
+        return explain(args.explain, ports, args.timeout, max(0, args.retries))
 
     try:
         networks = [ipaddress.IPv4Network(c, strict=False) for c in args.cidr] or local_networks()
@@ -471,7 +624,7 @@ def main() -> int:
               f"on {', '.join(str(n) for n in networks)}", file=sys.stderr)
 
     started = time.time()
-    results, open_count = scan(hosts, ports, args.timeout, max(1, args.workers))
+    results, stats = scan(hosts, ports, args.timeout, max(1, args.workers), max(0, args.retries))
     elapsed = time.time() - started
     http = sorted(
         [r for r in results if r["status"] is not None],
@@ -487,7 +640,10 @@ def main() -> int:
             "networks": [str(n) for n in networks],
             "local_ip": mine,
             "elapsed_secs": round(elapsed, 2),
-            "open_ports": open_count,
+            "probes": stats["probes"],
+            "attempts": stats["attempts"],
+            "counts": stats["counts"],
+            "silent_hosts": stats["silent_hosts"],
             "http": [_public(r) for r in http],
             "other": [_public(r) for r in not_http],
         }, indent=2))
@@ -514,14 +670,41 @@ def main() -> int:
         print(f"({len(not_http)} other open port(s) skipped; add --all to see them)")
         print()
 
-    print(f"scanned {len(hosts)} host(s) × {len(ports)} port(s) in {elapsed:.1f}s"
-          + (f"; * = this machine ({mine})" if mine else ""), file=sys.stderr)
-    print("""
-If these URLs open from the device that can't connect, the app and the network
+    counts = stats["counts"]
+    print(f"scanned {len(hosts)} host(s) × {len(ports)} port(s) on "
+          f"{', '.join(str(n) for n in networks)} in {elapsed:.1f}s"
+          + (f"; * = this machine ({mine})" if mine else ""))
+    print(f"  probes: {counts[OPEN]} open, {counts[REFUSED]} refused, "
+          f"{counts[TIMEOUT]} timed out, {counts[UNREACHABLE]} unreachable, "
+          f"{counts[ERROR]} error"
+          + (f" ({stats['attempts'] - 1} retry pass)" if stats["attempts"] > 1 else ""))
+    if stats["silent_hosts"]:
+        arp = arp_table()
+        up = [h for h in stats["silent_hosts"] if h in arp]
+        missing = [h for h in stats["silent_hosts"] if h not in arp]
+
+        def listing(items: list[str]) -> str:
+            head = ", ".join(items[:6])
+            return head + (f", +{len(items) - 6} more" if len(items) > 6 else "")
+
+        parts = []
+        if up:
+            parts.append(f"{len(up)} up but filtering every probed port ({listing(up)})")
+        if missing:
+            parts.append(f"{len(missing)} not answering at all, no ARP ({listing(missing)})")
+        print("  no TCP answer from " + "; ".join(parts))
+    if counts[UNREACHABLE] and counts[UNREACHABLE] * 2 >= stats["probes"]:
+        print("  everything is unreachable: on macOS 15+ give this terminal Local Network access "
+              "(System Settings → Privacy & Security → Local Network)")
+    print()
+    print("""If these URLs open from the device that can't connect, the app and the network
 are fine and the tunnel is the problem: `raemote status`, `raemote doctor`, and
 the app's Connection Logs. Apps bound to 127.0.0.1 never appear here — use
-`raemote discover --verbose` on the machine itself for those.""".strip(),
-          file=sys.stderr)
+`raemote discover --verbose` on the machine itself for those.
+
+A service you can open but this scan misses: run
+`--explain <ip>:<port>` for a port-by-port reason (refused / timed out / no
+route), or `--timeout 1 --retries 2` for a sleepy Wi-Fi device.""".strip())
     return 0 if http else 1
 
 
