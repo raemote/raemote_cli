@@ -39,7 +39,15 @@ scripts/lan-http-scan.py --cidr 192.168.1.0/24 --ports 80,8080,3000-3010
 scripts/lan-http-scan.py --all                 # also open ports that aren't HTTP
 scripts/lan-http-scan.py --json | jq -r '.http[].url'
 scripts/lan-http-scan.py --explain 192.168.1.20:3000   # one target, port by port
+scripts/lan-http-scan.py --all-ports           # every port 1-65535, not just common ones
 ```
+
+The default list is 30 common web/dev ports, so a service on an unusual port is
+not reported at all. `--all-ports` probes every port from 1 to 65535: it first
+narrows the network to hosts that answer at all (one probe plus the neighbour
+table), then sweeps them at 1024 parallel connects — roughly 30 s per live host,
+so a whole /24 takes a few minutes. Add `--all` to also see the open ports that
+answered nothing HTTP (printers, discovery services).
 
 A service you can open in a browser but the scan misses is almost always a
 sleeping Wi-Fi device: the first packet to it takes hundreds of milliseconds, so

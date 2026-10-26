@@ -13,6 +13,8 @@ Logs screen).
     scripts/lan-http-scan.py                    # auto-detect LAN(s), common ports
     scripts/lan-http-scan.py --cidr 192.168.1.0/24
     scripts/lan-http-scan.py --ports 80,8080,3000-3010
+    scripts/lan-http-scan.py --all-ports        # all 1-65535 ports (minutes)
+    scripts/lan-http-scan.py --explain 192.168.1.20:3000   # one target, in detail
     scripts/lan-http-scan.py --json             # machine-readable
     scripts/lan-http-scan.py -q                 # URLs only
 
@@ -35,6 +37,7 @@ import argparse
 import concurrent.futures
 import errno
 import ipaddress
+import itertools
 import json
 import re
 import socket
@@ -344,66 +347,140 @@ def probe(host: str, port: int, timeout: float) -> dict:
             "redirect": ""}
 
 
-def _sweep(pairs: list[tuple[str, int]], timeout: float, workers: int,
-           progress=None) -> dict[tuple[str, int], tuple[str, int]]:
+def _pairs(hosts: list[str], ports: list[int]):
+    for host in hosts:
+        for port in ports:
+            yield host, port
+
+
+CHUNK = 4096
+
+
+def _sweep(pairs, timeout: float, workers: int, report=None) -> dict[tuple[str, int], tuple[str, int]]:
+    """Probe `pairs`, keeping at most CHUNK futures alive.
+
+    Chunked rather than one future per pair: a full 1-65535 sweep would otherwise
+    build millions of futures (hundreds of MB) before the first probe returned.
+    """
     states: dict[tuple[str, int], tuple[str, int]] = {}
-    if not pairs:
-        return states
+    iterator = iter(pairs)
+    started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(port_state, host, port, timeout): (host, port)
-                   for host, port in pairs}
-        for future in concurrent.futures.as_completed(futures):
-            states[futures[future]] = future.result()
-            if progress:
-                progress(len(states))
+        while True:
+            batch = list(itertools.islice(iterator, CHUNK))
+            if not batch:
+                break
+            futures = {pool.submit(port_state, host, port, timeout): (host, port)
+                       for host, port in batch}
+            for future in concurrent.futures.as_completed(futures):
+                states[futures[future]] = future.result()
+            if report:
+                report(len(states), time.monotonic() - started)
     return states
 
 
+def _progress_printer(total: int, base: int = 0):
+    """A single self-updating stderr line: count, rate, ETA (TTY only)."""
+    last = [0.0]
+
+    def report(done: int, elapsed: float) -> None:
+        if not sys.stderr.isatty():
+            return
+        now = time.monotonic()
+        if now - last[0] < 0.25:
+            return
+        last[0] = now
+        count = base + done
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - count) / rate if rate > 0 else 0.0
+        print(f"\r  {count:,}/{total:,} probes  {rate:,.0f}/s  ETA {eta:4.0f}s   ",
+              end="", file=sys.stderr)
+
+    return report
+
+
+def live_hosts(hosts: list[str], timeout: float, workers: int) -> list[str]:
+    """Keep only hosts this machine can actually reach, before a huge sweep.
+
+    One probe per host is enough: a live host answers with a refusal or a SYN/ACK
+    *and* puts its MAC in the neighbour table, while an absent one yields "no
+    route"/timeout. Without this, a full 65535-port scan would try to ARP-resolve
+    every absent address 65 thousand times.
+    """
+    _sweep(((host, 80) for host in hosts), timeout, workers)
+    missing = [host for host in hosts if host not in arp_table()]
+    if missing:
+        # A sleeping device often drops the first SYN; one longer retry keeps it
+        # in the sweep instead of silently excluding it.
+        _sweep(((host, 80) for host in missing), timeout * 3, workers)
+    arp = arp_table()
+    alive = [host for host in hosts if host in arp]
+    return alive or hosts
+
+
 def scan(hosts: list[str], ports: list[int], timeout: float, workers: int,
-         retries: int = 1) -> tuple[list[dict], dict]:
-    pairs = [(host, port) for host in hosts for port in ports]
-    total = len(pairs)
+         retries: int = 1, progress: bool = True) -> tuple[list[dict], dict]:
+    total = len(hosts) * len(ports)
+    report = _progress_printer(total) if progress else None
 
-    def progress(done: int) -> None:
-        if done % 512 == 0 and sys.stderr.isatty():
-            print(f"\r  {done}/{total} probes…", end="", file=sys.stderr)
+    open_ports: list[tuple[str, int]] = []
+    timed_out: dict[tuple[str, int], str] = {}
+    counts = {state: 0 for state in (OPEN, REFUSED, TIMEOUT, UNREACHABLE, ERROR)}
+    answered: set[str] = set()
+    silent: set[str] = set()
 
-    states = _sweep(pairs, timeout, workers, progress)
-    if sys.stderr.isatty() and total >= 512:
-        print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+    def ingest(states: dict[tuple[str, int], tuple[str, int]]) -> None:
+        for (host, port), (state, _ms) in states.items():
+            counts[state] += 1
+            if state == OPEN:
+                open_ports.append((host, port))
+                answered.add(host)
+                silent.discard(host)
+            elif state == REFUSED:
+                answered.add(host)
+                silent.discard(host)
+            elif state in (TIMEOUT, ERROR):
+                timed_out[(host, port)] = state
+                silent.add(host)
+            else:
+                silent.add(host)
+
+    ingest(_sweep(_pairs(hosts, ports), timeout, workers, report))
+    if report and total >= 512:
+        print("\r" + " " * 52 + "\r", end="", file=sys.stderr)
 
     attempts = 1
-    if retries > 0:
+    if retries > 0 and timed_out:
         # A second look with a longer deadline, but only for hosts that are
         # demonstrably awake (they answered on some port, or the neighbour table
         # knows their MAC). Wi-Fi devices take hundreds of milliseconds to answer
         # the first packet — a single 0.35 s probe misses a service you can open
         # in a browser — while a host that is simply absent is not worth retrying.
-        alive = {host for (host, _port), (state, _ms) in states.items()
-                 if state in (OPEN, REFUSED)}
-        arp = arp_table()
-        alive.update(host for host in hosts if host in arp)
-        retry = [hp for hp, (state, _ms) in states.items()
-                 if state in (TIMEOUT, ERROR) and hp[0] in alive]
+        alive = answered | {host for host in hosts if host in arp_table()}
+        retry = [hp for hp in timed_out if hp[0] in alive]
         if retry:
             attempts += 1
-            states.update(_sweep(retry, timeout * 3, workers))
+            retried = _sweep(retry, timeout * 3, workers,
+                             _progress_printer(len(retry)))
+            for (host, port), (state, _ms) in retried.items():
+                counts[timed_out.pop((host, port), TIMEOUT)] -= 1
+                counts[state] += 1
+                if state == OPEN:
+                    open_ports.append((host, port))
+                    answered.add(host)
+                elif state == REFUSED:
+                    answered.add(host)
+                elif state in (TIMEOUT, ERROR):
+                    silent.add(host)
+            if sys.stderr.isatty():
+                print("\r" + " " * 52 + "\r", end="", file=sys.stderr)
 
-    open_ports = [hp for hp, (state, _) in states.items() if state == OPEN]
+    silent -= answered
     results: list[dict] = []
     if open_ports:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(open_ports))) as pool:
             results = list(pool.map(lambda hp: probe(hp[0], hp[1], timeout * 2), open_ports))
 
-    counts = {state: 0 for state in (OPEN, REFUSED, TIMEOUT, UNREACHABLE, ERROR)}
-    for state, _ in states.values():
-        counts[state] += 1
-    silent: dict[str, str] = {}
-    for (host, _port), (state, _ms) in states.items():
-        if state in (TIMEOUT, UNREACHABLE):
-            silent.setdefault(host, state)
-        elif state == OPEN:
-            silent.pop(host, None)
     stats = {
         "probes": total,
         "attempts": attempts,
@@ -567,30 +644,43 @@ def main() -> int:
                         help="ports, comma separated with optional ranges (default: common web ports)")
     parser.add_argument("--timeout", type=float, default=0.35, metavar="SECS",
                         help="per-connection timeout (default: 0.35)")
-    parser.add_argument("--workers", type=int, default=256, metavar="N",
-                        help="parallel probes (default: 256)")
+    parser.add_argument("--workers", type=int, default=None, metavar="N",
+                        help="parallel probes (default: 256, or 1024 with --all-ports)")
     parser.add_argument("--max-hosts", type=int, default=1024, metavar="N",
                         help="skip networks larger than this many hosts (default: 1024)")
     parser.add_argument("--allow-public", action="store_true",
                         help="also scan non-private ranges (default: refuse)")
+    parser.add_argument("--all-ports", action="store_true",
+                        help="probe all 65535 TCP ports instead of the common list "
+                             "(minutes, not seconds)")
     parser.add_argument("--all", action="store_true",
                         help="also list open ports that did not answer HTTP")
-    parser.add_argument("--retries", type=int, default=1, metavar="N",
-                        help="extra attempts for ports that timed out (default: 1)")
+    parser.add_argument("--retries", type=int, default=None, metavar="N",
+                        help="extra attempts for ports that timed out "
+                             "(default: 1, or 0 with --all-ports)")
     parser.add_argument("--explain", metavar="IP[:PORT]", default="",
                         help="probe one target port by port and explain the result, then exit")
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("-q", "--quiet", action="store_true", help="print URLs only")
     args = parser.parse_args()
 
-    try:
-        ports = parse_ports(args.ports) if args.ports else DEFAULT_PORTS
-    except ValueError as e:
-        print(f"raemote lan-scan: {e}", file=sys.stderr)
+    if args.all_ports and args.ports:
+        print("raemote lan-scan: --all-ports and --ports are mutually exclusive",
+              file=sys.stderr)
         return 2
+    if args.all_ports:
+        ports = list(range(1, 65536))
+    else:
+        try:
+            ports = parse_ports(args.ports) if args.ports else DEFAULT_PORTS
+        except ValueError as e:
+            print(f"raemote lan-scan: {e}", file=sys.stderr)
+            return 2
+    retries = args.retries if args.retries is not None else (0 if args.all_ports else 1)
+    workers = args.workers or (1024 if args.all_ports else 256)
 
     if args.explain:
-        return explain(args.explain, ports, args.timeout, max(0, args.retries))
+        return explain(args.explain, ports, args.timeout, max(0, retries))
 
     try:
         networks = [ipaddress.IPv4Network(c, strict=False) for c in args.cidr] or local_networks()
@@ -619,12 +709,23 @@ def main() -> int:
         return 2
 
     mine = local_ip()
+    total_probes = len(hosts) * len(ports)
+    if total_probes > 200_000:
+        # A full-port sweep only makes sense for hosts that exist: without this
+        # every absent address would be ARP-resolved 65 thousand times.
+        if not args.quiet and not args.json:
+            print(f"raemote lan-scan: {total_probes:,} probes — narrowing to hosts that answer first",
+                  file=sys.stderr)
+        hosts = live_hosts(hosts, args.timeout, workers)
+        total_probes = len(hosts) * len(ports)
+    port_label = "all 65535 ports" if args.all_ports else f"{len(ports)} port(s)"
     if not args.quiet and not args.json:
-        print(f"raemote lan-scan: {len(hosts)} host(s) × {len(ports)} port(s) "
-              f"on {', '.join(str(n) for n in networks)}", file=sys.stderr)
+        print(f"raemote lan-scan: {len(hosts)} host(s) × {port_label} "
+              f"= {total_probes:,} probes on {', '.join(str(n) for n in networks)}",
+              file=sys.stderr)
 
     started = time.time()
-    results, stats = scan(hosts, ports, args.timeout, max(1, args.workers), max(0, args.retries))
+    results, stats = scan(hosts, ports, args.timeout, workers, max(0, retries))
     elapsed = time.time() - started
     http = sorted(
         [r for r in results if r["status"] is not None],
@@ -665,13 +766,15 @@ def main() -> int:
             print(f"  {row['url']}" + (f"   {detail}" if detail else ""))
         print()
     else:
-        print("no HTTP services found")
+        print("no HTTP services found"
+              + ("" if args.all_ports else " (only the common web ports were probed; "
+                 "add --all-ports for 1-65535)"))
     if not_http and not args.all:
         print(f"({len(not_http)} other open port(s) skipped; add --all to see them)")
         print()
 
     counts = stats["counts"]
-    print(f"scanned {len(hosts)} host(s) × {len(ports)} port(s) on "
+    print(f"scanned {len(hosts)} host(s) × {port_label} ({total_probes:,} probes) on "
           f"{', '.join(str(n) for n in networks)} in {elapsed:.1f}s"
           + (f"; * = this machine ({mine})" if mine else ""))
     print(f"  probes: {counts[OPEN]} open, {counts[REFUSED]} refused, "
