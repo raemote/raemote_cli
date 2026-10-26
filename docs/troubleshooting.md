@@ -26,6 +26,33 @@ raemote logs --follow   # stream it live
 5. If the app says it is not authorized, your device may have been revoked —
    pair again with `raemote pair`.
 
+## Check the app directly, without raemote
+
+When the tunnel is the suspect, take it out of the picture. `scripts/lan-http-scan.py`
+(from the repository — Python 3, no dependencies, not part of the release
+tarballs) scans the network this machine is on, asks every open port for `/`, and
+prints what answered:
+
+```sh
+scripts/lan-http-scan.py                       # every LAN + common web ports
+scripts/lan-http-scan.py --cidr 192.168.1.0/24 --ports 80,8080,3000-3010
+scripts/lan-http-scan.py --all                 # also open ports that aren't HTTP
+scripts/lan-http-scan.py --json | jq -r '.http[].url'
+```
+
+Open one of the printed URLs **on the device that can't connect**:
+
+- it loads → the app and the network are fine, and the problem is the tunnel:
+  `raemote status`, `raemote doctor`, and the app's Connection Logs;
+- nothing on the list → the app either isn't running or is bound to `127.0.0.1`,
+  which a scan from another machine cannot see (by design). Check on the machine
+  itself: `raemote discover --verbose` lists every local listener and why it was
+  skipped, and `curl -I http://127.0.0.1:<port>` talks to it directly.
+
+Only private ranges are scanned by default, and the only traffic is a TCP connect
+plus one `GET /` per open port. On macOS 15+ your terminal needs *System Settings
+→ Privacy & Security → Local Network*, or every host looks dead.
+
 ## It worked before and now nothing connects
 
 The daemon heals its own network endpoint, so first check whether it had to:
