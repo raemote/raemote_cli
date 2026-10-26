@@ -37,6 +37,9 @@ pub struct Config {
     /// Logging.
     #[serde(default)]
     pub log: LogConfig,
+    /// Endpoint self-healing.
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
     /// Manually configured apps.
     #[serde(default)]
     pub apps: Vec<AppConfig>,
@@ -227,6 +230,56 @@ pub struct LogConfig {
     pub level: Option<String>,
 }
 
+/// Endpoint self-healing settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchdogConfig {
+    /// Rebuild the iroh endpoint when it wedges or loses its relay.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// "Dropping message for relay actor" warnings that mean the relay task
+    /// has stalled (they arrive one per network report, ~20-25s apart).
+    #[serde(default = "default_warn_threshold")]
+    pub warn_threshold: u64,
+    /// Rebuild after this long without any live relay connection; `0` disables
+    /// that trigger (the stall detector stays on).
+    #[serde(default = "default_offline_secs")]
+    pub offline_secs: u64,
+    /// Minimum time between rebuilds; doubles per consecutive rebuild.
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Cap for that backoff.
+    #[serde(default = "default_max_cooldown_secs")]
+    pub max_cooldown_secs: u64,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            warn_threshold: default_warn_threshold(),
+            offline_secs: default_offline_secs(),
+            cooldown_secs: default_cooldown_secs(),
+            max_cooldown_secs: default_max_cooldown_secs(),
+        }
+    }
+}
+
+fn default_warn_threshold() -> u64 {
+    3
+}
+
+fn default_offline_secs() -> u64 {
+    900
+}
+
+fn default_cooldown_secs() -> u64 {
+    300
+}
+
+fn default_max_cooldown_secs() -> u64 {
+    1800
+}
+
 /// A manually configured app: `/app/{name}` proxies to `127.0.0.1:{port}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -364,6 +417,23 @@ fn env_override(config: &mut Config) -> Result<()> {
         &mut config.discovery.max_concurrent_probes,
         "RAEMOTE_DISCOVERY_MAX_CONCURRENT_PROBES",
     );
+    override_from_env(&mut config.watchdog.enabled, "RAEMOTE_WATCHDOG_ENABLED");
+    override_from_env(
+        &mut config.watchdog.warn_threshold,
+        "RAEMOTE_WATCHDOG_WARN_THRESHOLD",
+    );
+    override_from_env(
+        &mut config.watchdog.offline_secs,
+        "RAEMOTE_WATCHDOG_OFFLINE_SECS",
+    );
+    override_from_env(
+        &mut config.watchdog.cooldown_secs,
+        "RAEMOTE_WATCHDOG_COOLDOWN_SECS",
+    );
+    override_from_env(
+        &mut config.watchdog.max_cooldown_secs,
+        "RAEMOTE_WATCHDOG_MAX_COOLDOWN_SECS",
+    );
     // RUST_LOG is handled by tracing-subscriber EnvFilter, not stored in config.
     Ok(())
 }
@@ -431,6 +501,15 @@ pub fn validate(config: &Config) -> Result<()> {
     }
     if config.discovery.max_concurrent_probes == 0 {
         errors.push("discovery.max_concurrent_probes must be > 0".into());
+    }
+    if config.watchdog.warn_threshold == 0 {
+        errors.push("watchdog.warn_threshold must be > 0".into());
+    }
+    if config.watchdog.cooldown_secs == 0 {
+        errors.push("watchdog.cooldown_secs must be > 0".into());
+    }
+    if config.watchdog.max_cooldown_secs < config.watchdog.cooldown_secs {
+        errors.push("watchdog.max_cooldown_secs must be >= watchdog.cooldown_secs".into());
     }
 
     let mut names = std::collections::HashSet::new();
@@ -513,6 +592,21 @@ exclude_origins = []
 
 [log]
 # level = "info"
+
+[watchdog]
+# Rebuild the iroh endpoint in place when its relay task stalls (the log line
+# "dropping message for relay actor, channel is full") or it loses every relay
+# for offline_secs. The node id, pairing token, paired devices and catalog all
+# survive a rebuild; connected devices are never interrupted (the rebuild waits
+# until they leave).
+enabled = true
+# Stall warnings that mean the relay task wedged (one per network report).
+warn_threshold = 3
+# Rebuild after this many seconds with no relay connection; 0 disables it.
+offline_secs = 900
+# Minimum gap between rebuilds, doubling each time up to max_cooldown_secs.
+cooldown_secs = 300
+max_cooldown_secs = 1800
 
 # [[apps]]
 # name = "my_app"

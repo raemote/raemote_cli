@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tracing_subscriber::EnvFilter;
 
 use crate::auth::{scope_from_ports, AuthState};
@@ -24,6 +24,7 @@ use crate::ipc::{
     StatusResponse, TokenResponse,
 };
 use crate::qr::print_binding;
+use crate::watchdog::{EndpointHandle, HealRequest, RelayActorSignal, RelayActorWedgeLayer};
 
 /// How long `DiscoverNow` waits for a scan to complete.
 const DISCOVER_NOW_TIMEOUT: Duration = Duration::from_secs(3);
@@ -37,7 +38,9 @@ struct DaemonState {
     catalog_generation: Arc<AtomicU64>,
     discovery_trigger: Arc<Notify>,
     auth: Arc<AuthState>,
-    endpoint: Endpoint,
+    /// The live endpoint (replaced in place by the watchdog), shared so status
+    /// always reports the running node.
+    endpoints: EndpointHandle,
     active_connections: Arc<AtomicUsize>,
     /// Per-node rate/concurrency limiters, shared with the serve handler so a
     /// revoked device's entry can be dropped (a client that merely
@@ -87,7 +90,7 @@ impl IpcHandler for DaemonState {
                 };
                 Response::Status(StatusResponse {
                     name: server_name,
-                    node_id: self.endpoint.id().to_string(),
+                    node_id: self.endpoints.id().to_string(),
                     uptime_secs: self.started_at.elapsed().as_secs(),
                     config_path: self.config_path.display().to_string(),
                     authorized_count: self.auth.authorized_count(),
@@ -96,27 +99,40 @@ impl IpcHandler for DaemonState {
                     token_ttl_secs: token_info.as_ref().map(|t| t.ttl.as_secs()),
                     active_connections: self.active_connections.load(Ordering::Relaxed),
                     cached_limiters: self.limiters.len(),
-                    relay_urls: self
-                        .endpoint
-                        .addr()
-                        .addrs
-                        .iter()
-                        .filter_map(|a| match a {
-                            iroh::TransportAddr::Relay(url) => Some(url.to_string()),
-                            _ => None,
-                        })
-                        .collect(),
+                    relay_urls: {
+                        let endpoint = self.endpoints.endpoint();
+                        endpoint
+                            .addr()
+                            .addrs
+                            .iter()
+                            .filter_map(|a| match a {
+                                iroh::TransportAddr::Relay(url) => Some(url.to_string()),
+                                _ => None,
+                            })
+                            .collect()
+                    },
                     bound_sockets: self
-                        .endpoint
+                        .endpoints
+                        .endpoint()
                         .bound_sockets()
                         .iter()
                         .map(|a| a.to_string())
                         .collect(),
+                    relay_connected: crate::watchdog::relay_connected(&self.endpoints.endpoint()),
+                    endpoint_uptime_secs: self.endpoints.uptime().as_secs(),
+                    endpoint_restarts: self.endpoints.restarts(),
+                    endpoint_last_restart: self
+                        .endpoints
+                        .last_restart()
+                        .map(|r| ipc::EndpointRestart {
+                            reason: r.reason,
+                            at_unix: r.at_unix,
+                        }),
                 })
             }
             Request::GetToken => match self.auth.current_token_info() {
                 Some(info) => {
-                    let uri = info.uri(self.endpoint.id());
+                    let uri = info.uri(self.endpoints.id());
                     Response::Token(TokenResponse {
                         uri,
                         expires_at_unix: info.expires_at_unix,
@@ -164,7 +180,7 @@ impl IpcHandler for DaemonState {
                     );
                 }
                 let info = self.auth.mint_token_with(ttl, fixed.as_deref(), scope);
-                let uri = info.uri(self.endpoint.id());
+                let uri = info.uri(self.endpoints.id());
                 Response::Token(TokenResponse {
                     uri,
                     expires_at_unix: info.expires_at_unix,
@@ -308,6 +324,71 @@ impl IpcHandler for DaemonState {
     }
 }
 
+/// How long retiring a replaced endpoint may take before it is abandoned.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A bound endpoint and the router serving it. Kept together so a rebuild
+/// swaps both at once.
+struct RunningNode {
+    endpoint: Endpoint,
+    router: Router,
+}
+
+/// Bind a fresh endpoint from `cfg`, sharing this server's key.
+///
+/// Called at startup and again by the watchdog: the same secret key means the
+/// same node id, so paired devices keep working across a rebuild.
+async fn bind_endpoint(cfg: &Config, secret_key: &iroh::SecretKey) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::N0);
+    // A configured private relay replaces N0's default relay map; the preset
+    // otherwise pins endpoint relay discovery to the default N0 set.
+    if let Some(relay) = &cfg.network.relay_url {
+        let url: iroh::RelayUrl = relay
+            .parse()
+            .with_context(|| format!("invalid network.relay_url: {relay}"))?;
+        tracing::info!("using configured relay {url}");
+        builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
+    }
+    if let Some(proxy) = crate::proxy::resolve(cfg.network.proxy.as_deref())? {
+        tracing::info!(
+            "using outbound proxy {} for iroh relay/discovery",
+            crate::proxy::redacted(&proxy)
+        );
+        builder = builder.proxy_url(proxy);
+    }
+    let endpoint = builder.secret_key(secret_key.clone()).bind().await?;
+
+    tracing::info!("node id: {}", endpoint.id());
+    tracing::info!("addr: {:?}", endpoint.addr());
+    tracing::info!("sockets: {:?}", endpoint.bound_sockets());
+    Ok(endpoint)
+}
+
+/// Spawn the protocol router (bind + serve ALPNs) on `endpoint`.
+fn spawn_router(
+    endpoint: &Endpoint,
+    auth: Arc<AuthState>,
+    bind_concurrency: usize,
+    state: Arc<AppState>,
+    config_generation: Arc<AtomicU64>,
+    active_connections: Arc<AtomicUsize>,
+    limiters: crate::http::LimiterRegistry,
+) -> Router {
+    Router::builder(endpoint.clone())
+        .accept(BIND_ALPN, BindHandler::new(auth.clone(), bind_concurrency))
+        .accept(
+            SERVE_ALPN,
+            ServeHandler::new(
+                state,
+                auth,
+                config_generation,
+                active_connections,
+                limiters,
+            ),
+        )
+        .spawn()
+}
+
 /// Run the daemon until shutdown.
 pub async fn run() -> Result<()> {
     let log_dir = crate::identity::ensure_data_dir()?;
@@ -318,7 +399,12 @@ pub async fn run() -> Result<()> {
     let config_log_level = config::load(&config::config_path(None)?)
         .ok()
         .and_then(|c| c.log.level.clone());
-    let _log_guard = init_tracing(&log_dir, config_log_level.as_deref())?;
+    let relay_signal = Arc::new(RelayActorSignal::default());
+    let _log_guard = init_tracing(
+        &log_dir,
+        config_log_level.as_deref(),
+        relay_signal.clone(),
+    )?;
 
     // Single-instance guard: refuse to start a second daemon against the same
     // state directory (the OS releases this lock if we exit or crash).
@@ -341,28 +427,8 @@ pub async fn run() -> Result<()> {
     tracing::info!("loaded config from {}", config_path.display());
 
     let secret_key = crate::identity::load_or_create_secret_key()?;
-    let mut builder = Endpoint::builder(presets::N0);
-    // A configured private relay replaces N0's default relay map; the preset
-    // otherwise pins endpoint relay discovery to the default N0 set.
-    if let Some(relay) = &cfg.network.relay_url {
-        let url: iroh::RelayUrl = relay
-            .parse()
-            .with_context(|| format!("invalid network.relay_url: {relay}"))?;
-        tracing::info!("using configured relay {url}");
-        builder = builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from(url)));
-    }
-    if let Some(proxy) = crate::proxy::resolve(cfg.network.proxy.as_deref())? {
-        tracing::info!(
-            "using outbound proxy {} for iroh relay/discovery",
-            crate::proxy::redacted(&proxy)
-        );
-        builder = builder.proxy_url(proxy);
-    }
-    let endpoint = builder.secret_key(secret_key).bind().await?;
-
-    tracing::info!("node id: {}", endpoint.id());
-    tracing::info!("addr: {:?}", endpoint.addr());
-    tracing::info!("sockets: {:?}", endpoint.bound_sockets());
+    let endpoint = bind_endpoint(&cfg, &secret_key).await?;
+    let endpoints = EndpointHandle::new(endpoint.clone());
 
     // Pin down the bind-level values before `cfg` is moved into the shared
     // config (the bind handler cannot change mid-run; reload reports the
@@ -408,27 +474,104 @@ pub async fn run() -> Result<()> {
 
     // The knob is applied at handler construction (it cannot change during a
     // run; reload reports it as restart-required instead of silently relying
-    // on the default).
-    let _router = Router::builder(endpoint.clone())
-        .accept(
-            BIND_ALPN,
-            BindHandler::new(auth.clone(), bind_concurrency),
-        )
-        .accept(
-            SERVE_ALPN,
-            ServeHandler::new(
-                state,
+    // on the default). Same for the endpoint: a rebuild re-uses this closure so
+    // the new node accepts the same two ALPNs with the same handlers.
+    let make_router = {
+        let auth = auth.clone();
+        let state = state.clone();
+        let config_generation = config_generation.clone();
+        let active_connections = active_connections.clone();
+        let limiters = limiters.clone();
+        move |endpoint: &Endpoint| {
+            spawn_router(
+                endpoint,
                 auth.clone(),
+                bind_concurrency,
+                state.clone(),
                 config_generation.clone(),
                 active_connections.clone(),
                 limiters.clone(),
-            ),
-        )
-        .spawn();
+            )
+        }
+    };
+    let node = Arc::new(tokio::sync::Mutex::new(RunningNode {
+        endpoint: endpoint.clone(),
+        router: make_router(&endpoint),
+    }));
 
     print_binding(&endpoint, &token);
 
     let shutdown = Arc::new(Notify::new());
+
+    // Endpoint self-healing: when iroh's relay task wedges (or the relay has
+    // been unreachable for a long time), bind a fresh endpoint with the same
+    // key, swap the router onto it, and retire the old one. Identity, token,
+    // paired devices and the catalog all live outside the endpoint, so nothing
+    // else changes; a rebuild waits for connected devices to leave.
+    let (heal_tx, mut heal_rx) = mpsc::channel::<HealRequest>(1);
+    let heal_handle = tokio::spawn({
+        let config = config.clone();
+        let endpoints = endpoints.clone();
+        let make_router = make_router.clone();
+        async move {
+            while let Some(request) = heal_rx.recv().await {
+                let cfg = {
+                    let cfg = config.read().expect("config poisoned");
+                    cfg.clone()
+                };
+                let new_endpoint = match bind_endpoint(&cfg, &secret_key).await {
+                    Ok(endpoint) => endpoint,
+                    Err(e) => {
+                        tracing::error!(
+                            reason = %request.reason,
+                            "endpoint watchdog: rebuild failed, keeping the current endpoint: {e:#}"
+                        );
+                        continue;
+                    }
+                };
+                let new_router = make_router(&new_endpoint);
+                let previous = {
+                    let mut node = node.lock().await;
+                    std::mem::replace(
+                        &mut *node,
+                        RunningNode {
+                            endpoint: new_endpoint.clone(),
+                            router: new_router,
+                        },
+                    )
+                };
+                endpoints.replace(new_endpoint.clone(), request.reason.as_str());
+                tracing::warn!(
+                    reason = %request.reason,
+                    node_id = %new_endpoint.id(),
+                    sockets = ?new_endpoint.bound_sockets(),
+                    "endpoint watchdog: endpoint rebuilt; new sockets and relay connection are live"
+                );
+                // Retire the old node in the background so a slow close cannot
+                // delay a later heal. No device is attached at this point (the
+                // watchdog only heals while `active_connections` is zero).
+                let RunningNode {
+                    endpoint: old_endpoint,
+                    router: old_router,
+                } = previous;
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(RETIRE_TIMEOUT, old_router.shutdown()).await;
+                    let _ = tokio::time::timeout(RETIRE_TIMEOUT, old_endpoint.close()).await;
+                });
+            }
+        }
+    });
+    let watchdog_handle = tokio::spawn(
+        crate::watchdog::Watchdog::new(
+            config.clone(),
+            relay_signal,
+            endpoints.clone(),
+            active_connections.clone(),
+            heal_tx,
+        )
+        .run(shutdown.clone()),
+    );
+
     let last_scan = Arc::new(RwLock::new(Vec::new()));
     let discovery_engine = DiscoveryEngine::new(
         config.clone(),
@@ -464,7 +607,7 @@ pub async fn run() -> Result<()> {
         catalog_generation,
         discovery_trigger,
         auth,
-        endpoint,
+        endpoints,
         active_connections,
         limiters,
         started_at: Instant::now(),
@@ -490,6 +633,8 @@ pub async fn run() -> Result<()> {
     // Cleanup
     ipc_handle.abort();
     discovery_handle.abort();
+    watchdog_handle.abort();
+    heal_handle.abort();
     let _ = std::fs::remove_file(&socket_cleanup);
     ipc::remove_daemon_json(&daemon_json);
 
@@ -501,9 +646,17 @@ pub async fn run() -> Result<()> {
 /// The returned guard must be kept alive for the process lifetime so buffered
 /// records are flushed on shutdown. Log files live in `~/.raemote` (mode
 /// `0700`), so their contents stay user-only.
+///
+/// The watchdog's [`RelayActorWedgeLayer`] is installed *before* the level
+/// filter: the stall warning is the only signal that iroh's relay task wedged,
+/// and the watchdog must see it even when the user has raised the level (or
+/// `RUST_LOG=error`). The `iroh::socket::transports::relay` target is also kept
+/// at `warn` so the line still reaches the log file and a human can see why the
+/// endpoint was rebuilt.
 fn init_tracing(
     log_dir: &std::path::Path,
     config_level: Option<&str>,
+    relay_signal: Arc<RelayActorSignal>,
 ) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::prelude::*;
 
@@ -519,13 +672,17 @@ fn init_tracing(
     // `RUST_LOG` wins; otherwise the `[log] level` config knob applies; when
     // neither is set the default is `info` so the log file is useful out of the
     // box.
-    let filter = EnvFilter::try_from_default_env().or_else(|_| {
+    let mut filter = EnvFilter::try_from_default_env().or_else(|_| {
         config_level
             .and_then(|level| EnvFilter::try_new(level).ok())
             .ok_or(())
     }).unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Ok(directive) = "iroh::socket::transports::relay=warn".parse() {
+        filter = filter.add_directive(directive);
+    }
 
     tracing_subscriber::registry()
+        .with(RelayActorWedgeLayer::new(relay_signal))
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .with(

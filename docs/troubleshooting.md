@@ -26,6 +26,28 @@ raemote logs --follow   # stream it live
 5. If the app says it is not authorized, your device may have been revoked —
    pair again with `raemote pair`.
 
+## It worked before and now nothing connects
+
+The daemon heals its own network endpoint, so first check whether it had to:
+`raemote status` shows `relay state` and `<n> rebuild(s), last <reason> at
+<when>`; `raemote doctor` repeats both checks.
+
+If the log has long runs of
+
+```
+WARN iroh::socket::transports::relay: dropping message for relay actor, channel is full
+```
+
+every 20–25 seconds, the relay task inside the networking library wedged. That
+is what the watchdog is for: it rebuilds the endpoint (same pairing, same
+devices) after a few of those warnings, or after 15 minutes without any relay.
+A rebuild is invisible to a phone that is already connected — it waits for the
+device to leave first — and a phone that reconnects a moment later reaches the
+new endpoint automatically.
+
+If rebuilds keep climbing, the network is the problem, not the daemon: check
+`raemote doctor` for the relay probe under *Restrictive networks* below.
+
 ## No apps appear
 
 - The app must answer an HTTP request at `/` like a web page. If it only serves

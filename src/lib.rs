@@ -23,7 +23,8 @@
 //! on-disk configuration, and [`proxy`] and [`lock`] add an outbound proxy and
 //! a single-instance guard. [`connector`] is the CLI's own local web client
 //! (`raemote connect`), pairing this machine and reverse-proxying a remote
-//! server's apps to `127.0.0.1`.
+//! server's apps to `127.0.0.1`. [`watchdog`] keeps the endpoint reachable by
+//! rebuilding it in place when iroh's relay task stalls.
 //!
 //! # Configuration
 //!
@@ -55,3 +56,4 @@ pub mod logs;
 pub mod proxy;
 pub mod qr;
 pub mod service;
+pub mod watchdog;

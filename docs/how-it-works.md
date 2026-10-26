@@ -52,6 +52,17 @@ the traffic instead.
 Either way, the connection is end-to-end encrypted: a relay can see that a
 connection happened and its endpoints, but not what is inside it.
 
+## Staying connected
+
+The computer keeps an eye on its own network path. If the library's relay task
+stops draining its queue — the log shows `dropping message for relay actor,
+channel is full` every 20 seconds or so — or if it has had no relay at all for
+15 minutes, `raemoted` rebuilds its endpoint in place: same node id, same
+pairing token, same paired devices and app list, fresh sockets. A rebuild waits
+until no device is connected, so it never cuts a session short, and repeats back
+off (5 minutes, doubling, capped at 30). `raemote status` reports how many times
+it happened and why.
+
 ## Discovery: finding your apps
 
 The server periodically looks at which processes on your computer are listening

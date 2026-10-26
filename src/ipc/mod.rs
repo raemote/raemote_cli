@@ -126,6 +126,29 @@ pub struct StatusResponse {
     pub relay_urls: Vec<String>,
     /// Local socket addresses the endpoint is bound to.
     pub bound_sockets: Vec<String>,
+    /// Whether the endpoint currently has a live relay connection. `None` when
+    /// iroh has not selected a home relay (startup, or no relay configured).
+    #[serde(default)]
+    pub relay_connected: Option<bool>,
+    /// Seconds since the current endpoint was bound by the daemon (it restarts
+    /// when the watchdog rebuilds it; [`Self::uptime_secs`] is the process).
+    #[serde(default)]
+    pub endpoint_uptime_secs: u64,
+    /// How many times the watchdog rebuilt the endpoint.
+    #[serde(default)]
+    pub endpoint_restarts: u64,
+    /// The most recent rebuild, if any.
+    #[serde(default)]
+    pub endpoint_last_restart: Option<EndpointRestart>,
+}
+
+/// One endpoint rebuild performed by the watchdog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointRestart {
+    /// Why the endpoint was rebuilt (`relay actor stalled`, `relay offline`).
+    pub reason: String,
+    /// Unix timestamp of the rebuild.
+    pub at_unix: u64,
 }
 
 /// Result of [`Request::DiscoverReport`]: the catalog, plus what was skipped.

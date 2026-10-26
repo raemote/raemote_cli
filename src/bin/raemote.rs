@@ -333,6 +333,23 @@ async fn cmd_status(json: bool) -> Result<()> {
             if let Some(relay) = s.relay_urls.first() {
                 println!("relay      : {relay}");
             }
+            match s.relay_connected {
+                Some(true) => println!("relay state: connected"),
+                Some(false) => println!("relay state: not connected (watchdog will rebuild if it lasts)"),
+                None => println!("relay state: selecting a relay"),
+            }
+            match &s.endpoint_last_restart {
+                Some(restart) => println!(
+                    "watchdog   : {} rebuild(s), last {} at {}",
+                    s.endpoint_restarts,
+                    restart.reason,
+                    humanize_unix(restart.at_unix)
+                ),
+                None => println!(
+                    "watchdog   : armed, 0 rebuilds (endpoint up {})",
+                    humanize_duration(s.endpoint_uptime_secs)
+                ),
+            }
             Ok(())
         }
         resp => Err(anyhow::anyhow!("unexpected response: {resp:?}")),
@@ -385,6 +402,16 @@ fn humanize_duration(secs: u64) -> String {
         format!("{}d", secs / 86_400)
     } else {
         format!("~{:.1} years", secs as f64 / 31_536_000.0)
+    }
+}
+
+/// Format a past unix timestamp relative to now (for example `3m 12s ago`).
+fn humanize_unix(ts: u64) -> String {
+    let now = unix_now();
+    if ts >= now {
+        "just now".to_string()
+    } else {
+        format!("{} ago", humanize_duration(now - ts))
     }
 }
 
@@ -875,6 +902,46 @@ async fn cmd_doctor(json: bool, verbose: bool) -> Result<()> {
             ),
         ));
 
+        // Endpoint health: the relay leg is what new clients need, and the
+        // watchdog is what recovers it without a restart.
+        match s.relay_connected {
+            Some(true) => checks.push(Check::ok(
+                "endpoint",
+                format!(
+                    "relay connected, up {}",
+                    humanize_duration(s.endpoint_uptime_secs)
+                ),
+            )),
+            Some(false) => checks.push(
+                Check::warn(
+                    "endpoint",
+                    format!(
+                        "no relay connection for the last {}",
+                        humanize_duration(s.endpoint_uptime_secs)
+                    ),
+                )
+                .with_hint(
+                    "the watchdog rebuilds the endpoint if this lasts; check \
+                     `raemote config get watchdog.offline_secs` and the relay/proxy",
+                ),
+            ),
+            None => checks.push(Check::warn("endpoint", "no relay selected yet")),
+        }
+
+        match &s.endpoint_last_restart {
+            Some(restart) => checks.push(Check::ok(
+                "watchdog",
+                format!(
+                    "{} rebuild(s), last {} at {}",
+                    s.endpoint_restarts, restart.reason, humanize_unix(restart.at_unix)
+                ),
+            )),
+            None => checks.push(Check::ok(
+                "watchdog",
+                "no rebuilds needed (endpoint stable)",
+            )),
+        }
+
         if s.discovered_count == 0 {
             checks.push(
                 Check::warn("discovery", "no web apps found").with_hint(
@@ -961,6 +1028,10 @@ async fn cmd_doctor(json: bool, verbose: bool) -> Result<()> {
             println!();
             println!("relays  : {}", s.relay_urls.join(", "));
             println!("sockets : {}", s.bound_sockets.join(", "));
+            println!("watchdog: {} rebuild(s), endpoint up {}",
+                s.endpoint_restarts,
+                humanize_duration(s.endpoint_uptime_secs)
+            );
             println!("config  : {}", s.config_path);
         }
         println!();
@@ -1125,6 +1196,11 @@ fn cmd_config_get(key: &str) -> Result<()> {
         "network.relay_url" => Some(cfg.network.relay_url.clone().unwrap_or_default()),
         "discovery.loopback_only" => Some(cfg.discovery.loopback_only.to_string()),
         "discovery.include_unattributed" => Some(cfg.discovery.include_unattributed.to_string()),
+        "watchdog.enabled" => Some(cfg.watchdog.enabled.to_string()),
+        "watchdog.warn_threshold" => Some(cfg.watchdog.warn_threshold.to_string()),
+        "watchdog.offline_secs" => Some(cfg.watchdog.offline_secs.to_string()),
+        "watchdog.cooldown_secs" => Some(cfg.watchdog.cooldown_secs.to_string()),
+        "watchdog.max_cooldown_secs" => Some(cfg.watchdog.max_cooldown_secs.to_string()),
         _ => None,
     };
     match value {
@@ -1196,6 +1272,21 @@ async fn cmd_config_set(key: &str, value: &str) -> Result<()> {
         }
         "network.relay_url" => {
             cfg.network.relay_url = (!value.is_empty()).then(|| value.to_string());
+        }
+        "watchdog.enabled" => {
+            cfg.watchdog.enabled = value.parse().context("invalid value")?;
+        }
+        "watchdog.warn_threshold" => {
+            cfg.watchdog.warn_threshold = value.parse().context("invalid value")?;
+        }
+        "watchdog.offline_secs" => {
+            cfg.watchdog.offline_secs = value.parse().context("invalid value")?;
+        }
+        "watchdog.cooldown_secs" => {
+            cfg.watchdog.cooldown_secs = value.parse().context("invalid value")?;
+        }
+        "watchdog.max_cooldown_secs" => {
+            cfg.watchdog.max_cooldown_secs = value.parse().context("invalid value")?;
         }
         _ => return Err(anyhow::anyhow!("unknown key: {key}")),
     }
